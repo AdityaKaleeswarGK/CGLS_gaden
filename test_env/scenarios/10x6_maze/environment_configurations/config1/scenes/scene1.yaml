@@ -5,4 +5,6 @@ playback_loop:
   to: 0
 simulations:
   - sim: sim1
-    gas_color: [0.4, 0.4, 0.4]
+    gas_color: [1.0, 0.5, 0.0]  # Orange (ethanol)
+  - sim: sim2
+    gas_color: [0.0, 0.5, 1.0]  # Blue (methane)

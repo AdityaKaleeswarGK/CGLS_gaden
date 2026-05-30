@@ -2,15 +2,15 @@ source:
   sourceType: cylinder
   radius: 0.4
   height: 1.45
-  position: [1.5, 1.5, 1.0]
-  gasType: 0  # ethanol
+  position: [8.5, 8.5, 1.0]
+  gasType: 3  # propanol
 deltaTime: 0.1
 windIterationDeltaTime: 1
 temperature: 298
 pressure: 1
 filamentPPMcenter: 20
 filamentInitialSigma: 10
-filamentGrowthGamma: 15
+filamentGrowthGamma: 2
 filamentNoise_std: 0.02
 numFilaments_sec: 10
 expectedNumIterations: 600

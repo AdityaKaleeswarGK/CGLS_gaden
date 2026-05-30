@@ -22,6 +22,7 @@ private:
     std::string input_sensor_frame;
     std::string input_fixed_frame;
     bool use_PID_correction_factors;
+    std::string target_gas;           // If non-empty, only measure this gas type (e.g. "ethanol")
 
     // MOX model params
     bool first_reading;           // First reading is set to baseline always

@@ -1,7 +1,7 @@
 source:
   sourceType: point
   position: [2.65, -2.95, 1.00]
-  gasType: 0
+  gasType: 0  # ethanol
 deltaTime: 0.1
 windIterationDeltaTime: 1
 temperature: 298

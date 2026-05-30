@@ -2,7 +2,11 @@ playback_initial_iteration: 0
 playback_loop:
   loop: false
   from: 0
-  to: 100
+  to: 0
 simulations:
   - sim: sim1
-    gas_color: [0.4, 0.4, 0.4]
+    gas_color: [1.0, 0.5, 0.0]  # Orange (ethanol)
+  - sim: sim2
+    gas_color: [0.0, 0.5, 1.0]  # Blue (methane)
+  - sim: sim3
+    gas_color: [0.0, 1.0, 0.5]  # Green (hydrogen)

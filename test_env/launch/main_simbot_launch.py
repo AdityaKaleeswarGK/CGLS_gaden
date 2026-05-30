@@ -14,10 +14,13 @@ import xacro
 
 def launch_arguments():
     return [
-        DeclareLaunchArgument("scenario", default_value="10x6_central_obstacle"),
+        DeclareLaunchArgument("scenario", default_value="Exp_C"),
         DeclareLaunchArgument("configuration", default_value="config1"),
         DeclareLaunchArgument("simulation", default_value="sim1"),
         DeclareLaunchArgument("namespace", default_value="PioneerP3DX"),
+        DeclareLaunchArgument("num_sensors", default_value="4",
+                              description="Number of PID gas sensors to launch (1-4). "
+                                          "Exp_C=4, 10x6_empty_room=3, MAPIRlab/10x6_maze=2"),
     ]
 # ==========================
 
@@ -28,6 +31,7 @@ def launch_setup(context, *args, **kwargs):
     scenario = LaunchConfiguration("scenario").perform(context)
     simulation = LaunchConfiguration("simulation").perform(context)
     configuration = LaunchConfiguration("configuration").perform(context)
+    num_sensors = int(LaunchConfiguration("num_sensors").perform(context))
 
     # robot description for state_publisher
     robot_desc = xacro.process_file(
@@ -95,7 +99,7 @@ def launch_setup(context, *args, **kwargs):
         Node(
             package="simulated_anemometer",
             executable="simulated_anemometer",
-            name="fake_anemometer",
+            name="wind_sensor",
             parameters=[
                 {"sensor_frame": parse_substitution("$(var namespace)_anemometer_frame")},
                 {"fixed_frame": "map"},
@@ -113,49 +117,99 @@ def launch_setup(context, *args, **kwargs):
         ),
     ]
 
-    PID = [
+    # GAS SENSORS configuration (gas1, gas2, gas3, gas4)
+    # =================================================
+
+    gas1 = [  # PID — ethanol only (sim1)
         Node(
             package="simulated_gas_sensor",
             executable="simulated_gas_sensor",
-            name="fake_pid",
+            name="gas1",
             parameters=[
                 {"sensor_model": 30},
-                {"sensor_frame": parse_substitution("$(var namespace)_pid_frame")},
+                {"target_gas": "ethanol"},
+                {"sensor_frame": parse_substitution("$(var namespace)_gas1_frame")},
                 {"fixed_frame": "map"},
-                {"noise_std": 20.1},
+                {"noise_std": 0.1},
                 {'use_sim_time': True},
             ]
         ),
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name='pid_tf_pub',
-            arguments=['0', '0', '0.5', '1.0', '0.0', '0', '0', parse_substitution('$(var namespace)_base_link'), parse_substitution('$(var namespace)_pid_frame')],
+            name='gas1_tf_pub',
+            arguments=['0.1', '0', '0.5', '1.0', '0.0', '0', '0', parse_substitution('$(var namespace)_base_link'), parse_substitution('$(var namespace)_gas1_frame')],
             parameters=[{'use_sim_time': True}]
         ),
     ]
 
-    TDLAS = [
+    gas2 = [  # PID — methane only (sim2)
         Node(
-            package="simulated_tdlas",
-            executable="simulated_tdlas",
-            name="simulated_tdlas",
+            package="simulated_gas_sensor",
+            executable="simulated_gas_sensor",
+            name="gas2",
             parameters=[
                 {"sensor_model": 30},
-                {"sensor_frame": parse_substitution("$(var namespace)_pid_frame")},
+                {"target_gas": "methane"},
+                {"sensor_frame": parse_substitution("$(var namespace)_gas2_frame")},
                 {"fixed_frame": "map"},
-                {"noise_std": 20.1},
+                {"noise_std": 0.1},
                 {'use_sim_time': True},
-                {'verbose': True},
             ]
         ),
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name='pid_tf_pub',
-            arguments=['0', '0', '0.75', '1.0', '0.0', '0', '0', 
-                       parse_substitution('$(var namespace)_base_link'), 
-                       parse_substitution('tdlas_frame')],
+            name='gas2_tf_pub',
+            arguments=['-0.1', '0', '0.5', '1.0', '0.0', '0', '0', parse_substitution('$(var namespace)_base_link'), parse_substitution('$(var namespace)_gas2_frame')],
+            parameters=[{'use_sim_time': True}]
+        ),
+    ]
+
+    gas3 = [  # PID — hydrogen only (sim3)
+        Node(
+            package="simulated_gas_sensor",
+            executable="simulated_gas_sensor",
+            name="gas3",
+            parameters=[
+                {"sensor_model": 30},
+                {"target_gas": "hydrogen"},
+                {"sensor_frame": parse_substitution("$(var namespace)_gas3_frame")},
+                {"fixed_frame": "map"},
+                {"noise_std": 0.1},
+                {'use_sim_time': True},
+            ]
+        ),
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='gas3_tf_pub',
+            arguments=['0', '0.1', '0.5', '1.0', '0.0', '0', '0',
+                       parse_substitution('$(var namespace)_base_link'),
+                       parse_substitution('$(var namespace)_gas3_frame')],
+            parameters=[{'use_sim_time': True}]
+        ),
+    ]
+
+    gas4 = [  # PID — propanol only (sim4)
+        Node(
+            package="simulated_gas_sensor",
+            executable="simulated_gas_sensor",
+            name="gas4",
+            parameters=[
+                {"sensor_model": 30},
+                {"target_gas": "propanol"},
+                {"sensor_frame": parse_substitution("$(var namespace)_gas4_frame")},
+                {"fixed_frame": "map"},
+                {"noise_std": 0.1},
+                {'use_sim_time': True},
+            ]
+        ),
+        Node(
+            package='tf2_ros',
+            executable='static_transform_publisher',
+            name='gas4_tf_pub',
+            arguments=['0', '-0.1', '0.5', '1.0', '0.0', '0', '0', parse_substitution('$(var namespace)_base_link'), parse_substitution('$(var namespace)_gas4_frame')],
             parameters=[{'use_sim_time': True}]
         ),
     ]
@@ -163,12 +217,25 @@ def launch_setup(context, *args, **kwargs):
     namespaced_actions = [PushRosNamespace(namespace)]
     namespaced_actions.extend(visualization_nodes)
 
+    # Gas-type → sensor config mapping (sensor index 1-based)
+    all_gas_sensors = [gas1, gas2, gas3, gas4]
+
     other_actions = [gaden_player]
     other_actions.extend(robot_simulator)
     other_actions.extend(anemometer)
-    other_actions.extend(PID)
+    for sensor_nodes in all_gas_sensors[:num_sensors]:
+        other_actions.extend(sensor_nodes)
     other_actions.append(nav2_nodes)
-    other_actions.extend(TDLAS)
+    
+    # Critical TF dummy link to solve Nav2 BehaviorTree hardcoded frame_id bugs
+    other_actions.append(Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='dummy_base_link_tf',
+        arguments=['0', '0', '0', '0', '0', '0', parse_substitution('$(var namespace)_base_link'), 'base_link'],
+        parameters=[{'use_sim_time': True}]
+    ))
+
     return [GroupAction(actions=namespaced_actions),
             GroupAction(actions=other_actions)
             ]

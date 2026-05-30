@@ -7,6 +7,6 @@ outlets_models:
   - ../../cad_models/MAPIRlab_doors.stl
   - ../../cad_models/MAPIRlab_windows.stl
 unprocessed_wind_files: ../../wind_simulations/W1/wind_at_cell_centers
-empty_point: [4.35, 0, 0]
+empty_point: [-4.05, 5.15, 0]
 cell_size: 0.1
 uniformWind: false

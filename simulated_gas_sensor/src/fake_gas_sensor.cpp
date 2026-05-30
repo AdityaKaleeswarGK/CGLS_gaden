@@ -244,6 +244,10 @@ float FakeGasSensor::simulate_mox_as_line_loglog(std::shared_ptr<gaden_msgs::srv
         // Handle multiple gases
         for (int i = 0; i < GT_gas_concentrations->positions[0].concentration.size(); i++)
         {
+            // If target_gas is set, skip all other gas types
+            if (!target_gas.empty() && strcmp(GT_gas_concentrations->gas_type[i].c_str(), target_gas.c_str()) != 0)
+                continue;
+
             int gas_id;
             if (!strcmp(GT_gas_concentrations->gas_type[i].c_str(), "ethanol"))
                 gas_id = 0;
@@ -326,6 +330,10 @@ float FakeGasSensor::simulate_pid(std::shared_ptr<gaden_msgs::srv::GasPosition_R
     float accumulated_conc = 0.0;
     for (int i = 0; i < GT_gas_concentrations->positions[0].concentration.size(); i++)
     {
+        // If target_gas is set, skip all other gas types
+        if (!target_gas.empty() && strcmp(GT_gas_concentrations->gas_type[i].c_str(), target_gas.c_str()) != 0)
+            continue;
+
         if (use_PID_correction_factors)
         {
             int gas_id;
@@ -366,11 +374,18 @@ void FakeGasSensor::loadNodeParameters()
     // PID_correction_factors
     use_PID_correction_factors = declare_parameter<bool>("use_PID_correction_factors", false);
 
+    // target_gas: if set, sensor only measures this gas type (e.g. "ethanol", "methane")
+    target_gas = declare_parameter<std::string>("target_gas", "");
+
     node_rate = declare_parameter<float>("rate", 10.0);
 
     RCLCPP_INFO(get_logger(), "The data provided in the roslaunch file is:");
     RCLCPP_INFO(get_logger(), "Sensor model: %d", input_sensor_model);
     RCLCPP_INFO(get_logger(), "Fixed frame: %s", input_fixed_frame.c_str());
     RCLCPP_INFO(get_logger(), "Sensor frame: %s", input_sensor_frame.c_str());
+    if (!target_gas.empty())
+        RCLCPP_INFO(get_logger(), "Target gas: %s (filtering enabled)", target_gas.c_str());
+    else
+        RCLCPP_INFO(get_logger(), "Target gas: ALL (no filtering)");
     RCLCPP_INFO(get_logger(), "Running at %fHz", node_rate);
 }

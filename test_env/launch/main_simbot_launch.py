@@ -104,7 +104,7 @@ def launch_setup(context, *args, **kwargs):
                 {"sensor_frame": parse_substitution("$(var namespace)_anemometer_frame")},
                 {"fixed_frame": "map"},
                 {"noise_std": 0.3},
-                {"use_map_ref_system": False},
+                {"use_map_ref_system": True},   # publish downwind direction in the map frame (used by auto_coverage_mapper for upwind source localization)
                 {'use_sim_time': True},
             ]
         ),

@@ -8,5 +8,3 @@ simulations:
     gas_color: [1.0, 0.5, 0.0]  # Orange (ethanol)
   - sim: sim2
     gas_color: [0.0, 0.5, 1.0]  # Blue (methane)
-  - sim: sim3
-    gas_color: [0.0, 1.0, 0.5]  # Green (hydrogen)

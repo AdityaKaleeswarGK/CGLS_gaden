@@ -1,6 +1,6 @@
 source:
   sourceType: point
-  position: [5.0, 3.0, 0.7]
+  position: [5.0, 3.0, 0.4]
   gasType: 1  # methane
 deltaTime: 0.1
 windIterationDeltaTime: 1

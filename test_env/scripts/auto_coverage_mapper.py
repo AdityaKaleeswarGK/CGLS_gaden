@@ -36,6 +36,10 @@ from nav2_msgs.action import NavigateToPose
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
 from olfaction_msgs.msg import GasSensor
+try:
+    from olfaction_msgs.msg import Anemometer
+except ImportError:
+    Anemometer = None
 from action_msgs.msg import GoalStatus
 from std_srvs.srv import Empty
 try:
@@ -65,10 +69,15 @@ class CUSUMDetector:
     O(1) per sample, no windowing, no hardcoded ppm values.
     """
 
-    def __init__(self, warmup: int = 50, k: float = 0.5, h: float = 4.0):
+    def __init__(self, warmup: int = 50, k: float = 0.5, h: float = 4.0,
+                 noise_floor: float = 0.1):
         self.warmup = warmup
         self.k_factor = k
         self.h_factor = h
+        # Sensor-noise floor for sigma (ppm). Makes detection scale-invariant:
+        # weak gases that never reach an absolute ppm level are still detected
+        # when they rise significantly above each sensor's own baseline noise.
+        self.noise_floor = noise_floor
 
         self._samples = []
         self._calibrated = False
@@ -109,11 +118,14 @@ class CUSUMDetector:
     def _calibrate(self):
         arr = np.array(self._samples)
         self._mu = float(np.mean(arr))
-        self._sigma = max(float(np.std(arr)), 0.01)  # floor to avoid div/0
+        # Floor sigma to the sensor-noise level (not a fixed 0.01). The drift
+        # and threshold are then purely relative to baseline noise, so a 0.5 ppm
+        # methane plume is just as detectable as a 30 ppm ethanol plume — both
+        # rise many sigma above their own (near-zero) baseline. No absolute ppm
+        # floor, which previously made sub-1-ppm gases impossible to detect.
+        self._sigma = max(float(np.std(arr)), self.noise_floor)
         self._drift = self.k_factor * self._sigma
-        # Threshold: at least 1.0 ppm absolute (prevents triggering on noise
-        # when baseline is zero, e.g. robot starts far from gas source)
-        self._threshold = max(self.h_factor * self._sigma, 1.0)
+        self._threshold = self.h_factor * self._sigma
         self._calibrated = True
         self._samples = []  # free memory
 
@@ -141,10 +153,17 @@ class AutoCoverageMapper(Node):
         self.declare_parameter('cusum_warmup', 50)         # samples before calibration
         self.declare_parameter('cusum_k', 0.75)            # drift sensitivity (higher = less sensitive)
         self.declare_parameter('cusum_h', 5.0)             # decision threshold (higher = fewer triggers)
+        self.declare_parameter('cusum_noise_floor', 0.1)   # sensor-noise sigma floor (ppm); scale-invariant detection
         # Hotspot validation gates — spike must pass ALL of these to become a fine-sweep region
         self.declare_parameter('min_spike_samples', 15)    # spike must last at least N samples
         self.declare_parameter('min_spike_peak_sigma', 3.0)  # peak must be > mean + N*sigma of baseline
+        self.declare_parameter('hotspot_min_abs_ppm', 0.3)  # small absolute floor (ppm); was 2.0 — blocked weak gases
         self.declare_parameter('max_hotspots', 3)          # cap total fine-sweep regions
+        # Reactive refinement: fine-sweep a hotspot the moment it is confirmed
+        # during the coarse sweep (instead of deferring all refinement to the
+        # end). Densely samples near the source while the robot is still there,
+        # which is what makes localization accurate.
+        self.declare_parameter('reactive_refine', True)
         # Slowdown
         self.declare_parameter('gas_slowdown_speed', 0.15)
         # Output control
@@ -166,6 +185,11 @@ class AutoCoverageMapper(Node):
         self.min_spike_samples = self.get_parameter('min_spike_samples').value
         self.min_spike_peak_sigma = self.get_parameter('min_spike_peak_sigma').value
         self.max_hotspots = self.get_parameter('max_hotspots').value
+        self.reactive_refine = self.get_parameter('reactive_refine').value
+        # Reactive-refinement state (shared between sensor callback and nav thread)
+        self._reactive_queue = []      # confirmed hotspots awaiting a local fine sweep
+        self._refined_centers = []     # (x, y) already refined — Phase 2 skips these
+        self._in_reactive = False      # guard against re-entrant reactive sweeps
 
         # Sensor type mapping: topic → gas name for CSV gas_type column
         self._sensor_type_map = {
@@ -179,13 +203,16 @@ class AutoCoverageMapper(Node):
         cusum_warmup = self.get_parameter('cusum_warmup').value
         cusum_k = self.get_parameter('cusum_k').value
         cusum_h = self.get_parameter('cusum_h').value
-        self._cusum_params = (cusum_warmup, cusum_k, cusum_h)
+        cusum_noise_floor = self.get_parameter('cusum_noise_floor').value
+        self.hotspot_min_abs_ppm = self.get_parameter('hotspot_min_abs_ppm').value
+        self._cusum_params = (cusum_warmup, cusum_k, cusum_h, cusum_noise_floor)
 
         self._cusums = {}              # topic → CUSUMDetector
         self._cusum_spiking = {}       # topic → bool
         self._spike_positions = {}     # topic → [(x, y, ppm), ...] during active spike
         for t in self.topics:
-            self._cusums[t] = CUSUMDetector(warmup=cusum_warmup, k=cusum_k, h=cusum_h)
+            self._cusums[t] = CUSUMDetector(warmup=cusum_warmup, k=cusum_k, h=cusum_h,
+                                            noise_floor=cusum_noise_floor)
             self._cusum_spiking[t] = False
             self._spike_positions[t] = []
 
@@ -222,6 +249,27 @@ class AutoCoverageMapper(Node):
             self.dataset[t] = {'x': [], 'y': [], 'ppm': [], 'timestamp': []}
             self.create_subscription(GasSensor, t, lambda msg, t=t: self.sensor_cb(msg, t), 10, callback_group=self.cbg)
 
+        # ── Anemometer: measured wind enables proper upwind source localization ──
+        # The launch publishes the downwind direction in the map frame
+        # (use_map_ref_system:=True). We collect downwind unit vectors and use
+        # their mean to point the localizer upwind toward the source. Falls back
+        # to the wind-free PCA method when no wind is available.
+        self.declare_parameter('wind_topic', '/wind_sensor/WindSensor_reading')
+        self.wind_topic = self.get_parameter('wind_topic').value
+        # Wind upwind-shift is OFF by default: a single mean-wind vector helps on
+        # steady flow but hurts on turbulent/dynamic fields. The robust
+        # ppm²-centroid is the default. Enable to experiment on steady-wind sites.
+        self.declare_parameter('use_wind_shift', False)
+        self.use_wind_shift = self.get_parameter('use_wind_shift').value
+        # Each entry: (robot_x, robot_y, downwind_x, downwind_y). Position is kept
+        # so we can compute *local* wind in each gas's plume — the field is
+        # non-uniform indoors, so one global wind vector is not enough.
+        self._wind_vecs = []
+        if Anemometer is not None and self.wind_topic:
+            self.create_subscription(Anemometer, self.wind_topic, self._wind_cb,
+                                     10, callback_group=self.cbg)
+            self.get_logger().info(f"Subscribing to anemometer on: {self.wind_topic}")
+
         lqos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL, reliability=QoSReliabilityPolicy.RELIABLE)
         map_topic = f'/{self.ns}/map'
         self.get_logger().info(f"Subscribing to map on: {map_topic}")
@@ -249,6 +297,11 @@ class AutoCoverageMapper(Node):
         self._csv_file.flush()
         self._current_phase = 'coarse'
         self._sample_count = 0
+
+        # ── Source-localization results / benchmark state ──
+        self._loc_results = {}      # clean_topic -> _estimate_source() dict
+        self._metrics = {}          # benchmark metrics (errors, latency, coverage)
+        self._true_sources = None   # ground-truth sources parsed from sim.yaml (lazy)
 
         # Live concentration grid publisher (OccupancyGrid-style, 0-100 scaled)
         self._conc_grid_res = 0.2  # 20cm cells
@@ -279,6 +332,63 @@ class AutoCoverageMapper(Node):
             return True
         except Exception:
             return False
+
+    def _wind_cb(self, msg):
+        """Record (robot_x, robot_y, downwind_x, downwind_y) in the map frame.
+        Only keep readings with meaningful wind speed. Note: the sim's wind_speed
+        is u²+v², so any positive value indicates real flow."""
+        if msg.wind_speed <= 1e-4:
+            return
+        ang = float(msg.wind_direction)   # downwind direction in map frame
+        self._wind_vecs.append((self.robot_x, self.robot_y,
+                                math.cos(ang), math.sin(ang)))
+
+    @staticmethod
+    def _resultant(vecs):
+        """Mean downwind unit vector + consistency (mean resultant length 0..1)."""
+        arr = np.asarray(vecs)
+        mx, my = float(arr[:, 0].mean()), float(arr[:, 1].mean())
+        r = math.hypot(mx, my)
+        if r < 1e-3:
+            return None
+        return (mx / r, my / r), r
+
+    def _mean_wind(self, min_samples=20):
+        """Global mean wind: (upwind, downwind, consistency) or None."""
+        if len(self._wind_vecs) < min_samples:
+            return None
+        res = self._resultant([(v[2], v[3]) for v in self._wind_vecs])
+        if res is None:
+            return None
+        (dwx, dwy), r = res
+        return (-dwx, -dwy), (dwx, dwy), r
+
+    def _local_wind(self, xp, yp, pp, radius=1.5, min_samples=15):
+        """Wind averaged over the robot positions inside *this* gas's plume
+        (near its strong readings). Returns (upwind, downwind, consistency) or
+        None. This is what makes wind usable when the field is non-uniform."""
+        if len(self._wind_vecs) < min_samples or len(pp) == 0:
+            return None
+        from scipy.spatial import cKDTree
+        warr = np.asarray(self._wind_vecs)
+        # plume = positions of the strongest readings for this gas
+        thr = max(0.3 * float(pp.max()), 0.15)
+        mask = pp >= thr
+        if mask.sum() < 5:
+            mask = pp > 0.1
+        plume_xy = np.column_stack([xp[mask], yp[mask]])
+        tree = cKDTree(warr[:, :2])
+        idx = set()
+        for q in plume_xy:
+            idx.update(tree.query_ball_point(q, radius))
+        if len(idx) < min_samples:
+            return None
+        sel = warr[sorted(idx)]
+        res = self._resultant(sel[:, 2:4])
+        if res is None:
+            return None
+        (dwx, dwy), r = res
+        return (-dwx, -dwy), (dwx, dwy), r
 
     def sensor_cb(self, msg, topic):
         if not self._running or self._csv_file.closed:
@@ -345,7 +455,7 @@ class AutoCoverageMapper(Node):
             return
 
         # ── Gate 2: Minimum absolute concentration ──
-        min_abs_ppm = 2.0  # reject hotspots below 2 ppm peak — clearly not a source
+        min_abs_ppm = self.hotspot_min_abs_ppm  # small noise floor; relative gate does the real work
         if peak_ppm < min_abs_ppm:
             self.get_logger().info(
                 f"Spike REJECTED [{topic}]: peak {peak_ppm:.2f} ppm < "
@@ -394,6 +504,12 @@ class AutoCoverageMapper(Node):
             f"CONFIRMED HOTSPOT [{topic}] #{len(topic_hotspots)} at ({cx:.2f}, {cy:.2f}), "
             f"peak={peak_ppm:.1f} ppm, {num_samples} samples"
         )
+        # Queue for an immediate local fine sweep (drained by the nav thread
+        # between coarse waypoints) unless this area was already refined.
+        if self.reactive_refine and not any(
+                math.hypot(cx - rx, cy - ry) < self.hotspot_pad
+                for rx, ry in self._refined_centers):
+            self._reactive_queue.append((cx, cy, peak_ppm))
         self._spike_positions[topic] = []
 
     def _merge_all_hotspots(self):
@@ -693,6 +809,14 @@ class AutoCoverageMapper(Node):
                 f"at {self.fine_step}m resolution ═══"
             )
             for i, (hx, hy, hp) in enumerate(self._hotspots):
+                # Skip hotspots already covered by a reactive fine sweep
+                if any(math.hypot(hx - rx, hy - ry) < self.hotspot_pad
+                       for rx, ry in self._refined_centers):
+                    self.get_logger().info(
+                        f"Hotspot #{i + 1} ({hx:.2f}, {hy:.2f}) already refined "
+                        f"reactively — skipping."
+                    )
+                    continue
                 bbox = (
                     hx - self.hotspot_pad,
                     hy - self.hotspot_pad,
@@ -752,6 +876,12 @@ class AutoCoverageMapper(Node):
             if success:
                 consecutive_failures = 0
                 last_good_x, last_good_y = wx, wy
+                # React to hotspots confirmed while sweeping: fine-sweep them now,
+                # while the robot is still nearby. Only during the coarse phase
+                # and never re-entrantly (a reactive sweep won't spawn another).
+                if (phase_label == "Coarse" and self.reactive_refine
+                        and not self._in_reactive and self._reactive_queue):
+                    self._do_reactive_refine()
             else:
                 skipped += 1
                 consecutive_failures += 1
@@ -777,6 +907,35 @@ class AutoCoverageMapper(Node):
 
         self.get_logger().info(f"[{phase_label}] Done: {total - skipped}/{total} waypoints reached.")
         return skipped
+
+    def _do_reactive_refine(self):
+        """Drain the reactive hotspot queue: run a tight fine sweep around each
+        freshly-confirmed hotspot immediately, then return to the coarse sweep.
+        This is what gives the localizer dense, near-source samples."""
+        self._in_reactive = True
+        prev_phase = self._current_phase
+        try:
+            while self._reactive_queue and rclpy.ok() and self._running:
+                hx, hy, hp = self._reactive_queue.pop(0)
+                if any(math.hypot(hx - rx, hy - ry) < self.hotspot_pad
+                       for rx, ry in self._refined_centers):
+                    continue
+                bbox = (hx - self.hotspot_pad, hy - self.hotspot_pad,
+                        hx + self.hotspot_pad, hy + self.hotspot_pad)
+                fine_wps = self._generate_bcd_waypoints(self.fine_step, bbox=bbox)
+                if not fine_wps:
+                    continue
+                self.refinement_waypoints.extend(fine_wps)
+                self._refined_centers.append((hx, hy))
+                self._current_phase = 'fine'
+                self.get_logger().info(
+                    f"⚡ REACTIVE refine at ({hx:.2f}, {hy:.2f}) peak={hp:.1f} ppm: "
+                    f"{len(fine_wps)} fine waypoints (interrupting coarse sweep)"
+                )
+                self._execute_waypoints(fine_wps, phase_label="ReactiveRefine")
+        finally:
+            self._current_phase = prev_phase
+            self._in_reactive = False
 
     # ────────────────────────────────────────────────────────────
     #  Laser scan callback & helpers
@@ -1245,6 +1404,66 @@ class AutoCoverageMapper(Node):
             for i, (hx, hy, hp) in enumerate(self._hotspots):
                 lines.append(f'| {i+1} | {hx:.2f} | {hy:.2f} | {hp:.1f} |')
 
+        # ── Localization benchmark (predicted vs. ground truth) ──
+        if self._metrics:
+            m = self._metrics
+            if self._true_sources is None:
+                self._true_sources = self._parse_true_sources()
+
+            lines.append('\n## Source Localization Benchmark\n')
+            wind_info = self._mean_wind()
+            if wind_info:
+                up, dw, cons = wind_info
+                lines.append(f'*Wind-aware estimate: measured wind (downwind '
+                             f'({dw[0]:.2f}, {dw[1]:.2f}), consistency {cons:.2f}) '
+                             f'points the localizer upwind; estimate = upwind edge '
+                             f'of detected gas. Ground truth from `sim.yaml` '
+                             f'(assumes GADEN world == ROS `map` frame).*\n')
+            else:
+                lines.append('*Wind-free estimate: ppm²-weighted PCA plume axis + '
+                             'time-persistent anisotropic posterior, point estimate '
+                             'shifted upwind. Ground truth parsed from `sim.yaml` '
+                             '(assumes GADEN world frame == ROS `map` frame).*\n')
+
+            if self._true_sources:
+                lines.append('**Ground-truth sources:** ' + ', '.join(
+                    f"{s['name']} ({s['x']:.2f}, {s['y']:.2f})"
+                    for s in self._true_sources) + '\n')
+
+            per_gas = m.get('per_gas', {})
+            if per_gas:
+                lines.append('| Sensor | Estimate (x, y) | True Source | '
+                             'Error (m) | Peak ppm | Method | Confidence | Latency (s) |')
+                lines.append('|--------|-----------------|-------------|'
+                             '-----------|----------|--------|------------|-------------|')
+                errs = []
+                lat = m.get('detection_latency_s', {})
+                for clean, e in per_gas.items():
+                    est = f"({e['src_x']:.2f}, {e['src_y']:.2f})"
+                    if 'error_m' in e:
+                        tgt = f"{e['true_name']} ({e['true_x']:.2f}, {e['true_y']:.2f})"
+                        err = f"{e['error_m']:.2f}"
+                        errs.append(e['error_m'])
+                    else:
+                        tgt, err = 'N/A', 'N/A'
+                    conf = 'low' if e.get('low_confidence') else 'ok'
+                    peak = f"{e.get('peak_ppm', 0.0):.2f}"
+                    meth = e.get('method', 'wind-free')
+                    lt = lat.get(clean)
+                    lt_s = f'{lt:.1f}' if lt is not None else 'never'
+                    lines.append(f'| `{clean}` | {est} | {tgt} | {err} | {peak} | {meth} | {conf} | {lt_s} |')
+                if errs:
+                    lines.append(f'\n- **Mean localization error:** {np.mean(errs):.2f} m')
+                    lines.append(f'- **Best / worst:** {min(errs):.2f} m / {max(errs):.2f} m')
+
+            if 'path_length_m' in m:
+                lines.append(f'- **Path length:** {m["path_length_m"]:.1f} m')
+            if 'coverage_pct_per_m' in m:
+                lines.append(f'- **Coverage efficiency:** '
+                             f'{m["coverage_pct_per_m"]:.2f} %/m')
+            lines.append('\nSee `benchmark_localization.png` and '
+                         '`*_source_localization.png` for the probability maps.\n')
+
         lines.append(f'\n## Output Files\n')
         lines.append(f'- `readings.csv` — Full sensor readings (timestamp, x, y, gas_type, ppm, phase)')
         lines.append(f'- `occupancy_grid.pgm` — Occupancy grid of the environment')
@@ -1305,6 +1524,20 @@ class AutoCoverageMapper(Node):
         npz_path = os.path.join(self._run_dir, 'run_data.npz')
 
         save_dict = {}
+
+        # Mean measured wind (upwind direction → source), shared across gases
+        wind_info = self._mean_wind()
+        wind_up = wind_info[0] if wind_info else None
+        wind_cons = wind_info[2] if wind_info else 0.0
+        if wind_info:
+            print(f"Mean wind: downwind→({wind_info[1][0]:.2f}, {wind_info[1][1]:.2f}), "
+                  f"consistency={wind_cons:.2f} ({len(self._wind_vecs)} samples)")
+            save_dict['wind_upwind_xy'] = np.array(wind_up)
+            save_dict['wind_downwind_xy'] = np.array(wind_info[1])
+            save_dict['wind_consistency'] = np.array(wind_cons)
+        else:
+            print("No usable wind data — using wind-free localization.")
+
         for t, d in self.dataset.items():
             clean = t.replace('/', '_').strip('_')
             save_dict[f'{clean}_x'] = np.array(d['x'])
@@ -1314,13 +1547,42 @@ class AutoCoverageMapper(Node):
 
             # Run source localization and save posterior
             xs, ys_arr, ppm_arr = np.array(d['x']), np.array(d['y']), np.array(d['ppm'])
+            ts_arr = np.array(d['timestamp'])
             if len(xs) > 10:
-                posterior, gx, gy, bx, by, cr = self._estimate_source(xs, ys_arr, ppm_arr)
-                save_dict[f'{clean}_posterior'] = posterior
-                save_dict[f'{clean}_posterior_gx'] = gx
-                save_dict[f'{clean}_posterior_gy'] = gy
-                save_dict[f'{clean}_source_xy'] = np.array([bx, by])
-                save_dict[f'{clean}_source_confidence'] = np.array(cr)
+                # Per-gas LOCAL wind (the field is non-uniform); fall back to
+                # the global mean only if there isn't enough local wind data.
+                lw = self._local_wind(xs, ys_arr, ppm_arr)
+                g_up = lw[0] if lw else wind_up
+                g_cons = lw[2] if lw else wind_cons
+                r = self._estimate_source(xs, ys_arr, ppm_arr, timestamps=ts_arr,
+                                          wind=g_up, wind_consistency=g_cons,
+                                          use_wind_shift=self.use_wind_shift)
+                self._loc_results[clean] = r
+                if g_up is not None:
+                    save_dict[f'{clean}_wind_upwind_xy'] = np.array(g_up)
+                    save_dict[f'{clean}_wind_consistency'] = np.array(g_cons)
+                save_dict[f'{clean}_posterior'] = r['posterior']
+                save_dict[f'{clean}_posterior_gx'] = r['gx']
+                save_dict[f'{clean}_posterior_gy'] = r['gy']
+                save_dict[f'{clean}_source_xy'] = np.array([r['src_x'], r['src_y']])
+                save_dict[f'{clean}_map_xy'] = np.array([r['best_x'], r['best_y']])
+                save_dict[f'{clean}_source_confidence'] = np.array(r['conf_radius'])
+                save_dict[f'{clean}_plume_axis'] = np.array(r['axis'])
+                save_dict[f'{clean}_sigma_major_minor'] = np.array(
+                    [r['sigma_major'], r['sigma_minor']])
+                save_dict[f'{clean}_directional'] = np.array(r.get('directional', False))
+                save_dict[f'{clean}_low_confidence'] = np.array(r.get('low_confidence', False))
+                save_dict[f'{clean}_peak_ppm'] = np.array(r.get('peak_ppm', 0.0))
+                save_dict[f'{clean}_method'] = np.array(r.get('method', 'wind-free'))
+
+        # Localization benchmark metrics (error vs. ground truth, latency, …)
+        self._compute_localization_metrics()
+        if self._true_sources:
+            save_dict['true_sources_xy'] = np.array(
+                [[s['x'], s['y']] for s in self._true_sources])
+            for clean, e in self._metrics.get('per_gas', {}).items():
+                if 'error_m' in e:
+                    save_dict[f'{clean}_loc_error_m'] = np.array(e['error_m'])
 
         # Save hotspots
         save_dict['hotspots'] = np.array(self._hotspots) if self._hotspots else np.array([])
@@ -1351,90 +1613,409 @@ class AutoCoverageMapper(Node):
         print(f"CSV log finalized: {self._csv_path} ({self._sample_count} samples)")
 
     # ────────────────────────────────────────────────────────────
-    #  Bayesian Source Localization (isotropic diffusion model)
+    #  Ground-truth sources (for benchmarking)
     # ────────────────────────────────────────────────────────────
-    def _estimate_source(self, xs, ys, ppm, grid_res=0.08):
+    def _parse_true_sources(self):
+        """Parse ground-truth gas source positions from the scenario's
+        simulations/*/sim.yaml files.
+
+        Returns a list of dicts: {'name', 'x', 'y', 'z', 'gas_type'}.
+
+        NOTE: assumes the GADEN world frame coincides with the ROS 'map' frame
+        (true for the BasicSim setup used here, where the robot is spawned in
+        GADEN world coordinates). If a static map offset is ever introduced,
+        these positions would need to be transformed before comparison.
         """
-        Bayesian source localization using weighted kernel density.
+        sources = []
+        if not (self.scenario_path and os.path.isdir(self.scenario_path)):
+            return sources
+        sim_dir = os.path.join(self.scenario_path, 'simulations')
+        if not os.path.isdir(sim_dir):
+            return sources
+        for sim_name in sorted(os.listdir(sim_dir)):
+            sim_yaml = os.path.join(sim_dir, sim_name, 'sim.yaml')
+            if not os.path.isfile(sim_yaml):
+                continue
+            try:
+                with open(sim_yaml) as f:
+                    cfg = yaml.safe_load(f)
+                src = cfg.get('source', {}) or {}
+                pos = src.get('position', None)
+                if pos and len(pos) >= 2:
+                    sources.append({
+                        'name': sim_name,
+                        'x': float(pos[0]), 'y': float(pos[1]),
+                        'z': float(pos[2]) if len(pos) > 2 else 0.0,
+                        'gas_type': src.get('gasType', cfg.get('gasType', 'N/A')),
+                    })
+            except Exception:
+                pass
+        return sources
 
-        Strategy:
-        1. Filter to positive readings only (zeros carry no source info).
-        2. For each candidate source cell, compute a score based on how well
-           the ppm-weighted distance pattern matches a monotonic decay from
-           that point. Uses a Gaussian kernel exp(-r²/2L²) with scale L
-           estimated from the data spread.
-        3. The score is tempered to avoid posterior collapse.
+    # ────────────────────────────────────────────────────────────
+    #  Wind-free probabilistic Source Localization
+    # ────────────────────────────────────────────────────────────
+    def _top_candidates(self, posterior, gx, gy, n=3, min_sep=0.8):
+        """Return up to N well-separated posterior maxima as ranked candidates:
+        [(x, y, probability), ...] sorted high→low."""
+        order = np.argsort(posterior.ravel())[::-1]
+        cands = []
+        for idx in order:
+            r, c = np.unravel_index(idx, posterior.shape)
+            x, y, p = float(gx[r, c]), float(gy[r, c]), float(posterior[r, c])
+            if all(math.hypot(x - cx, y - cy) > min_sep for cx, cy, _ in cands):
+                cands.append((x, y, p))
+            if len(cands) >= n:
+                break
+        return cands
 
-        Returns:
-            posterior, grid_x, grid_y, best_x, best_y, confidence_radius
+    def _estimate_source(self, xs, ys, ppm, timestamps=None, grid_res=0.08,
+                         wind=None, wind_consistency=0.0, use_wind_shift=False):
+        """Probabilistic gas-source-REGION localization.
+
+        Primary output is a probability *region* (the posterior) plus ranked
+        candidate cells — "where to look" — not a false pinpoint. The point
+        estimate defaults to the robust ppm²-weighted centroid of the detected
+        gas (the accumulation region).
+
+        Optional (`use_wind_shift=True`): when a measured wind direction is
+        available and consistent, the centroid is nudged ~1σ upwind. This helps
+        on steady wind but can hurt on turbulent/dynamic fields, so it is OFF by
+        default.
+
+        Without wind it falls back to the wind-free method below.
+
+        Without an anemometer we cannot back-track along the wind, so rather
+        than claim a single point (false precision) we return a *probability
+        distribution* over source location, plus a best-guess point and a
+        ranked list of candidate spots.
+
+        Method:
+          1. Use only positive readings, weighted by ppm**2 (concentration
+             peaks are far more informative than the diffuse tail).
+          2. Recover the plume's principal axis from the data via a
+             ppm**2-weighted PCA. A plume is elongated along the wind; its
+             high-concentration end is the source and the long diffuse tail is
+             downwind. This recovers an *approximate wind axis with no
+             anemometer*.
+          3. Build an anisotropic (axis-aligned) kernel-density posterior,
+             combined across time bins by geometric mean so that only spots
+             that are *persistently* gassy score highly — a real leak is
+             stationary, while plume meander averages out.
+          4. The point estimate is the ppm**2-weighted centroid nudged upwind
+             (toward the high-concentration end) to de-bias the systematic
+             downwind offset of the raw peak/centroid.
+
+        Returns a dict with keys:
+            posterior, gx, gy            — the probability distribution
+            best_x, best_y               — MAP (argmax of posterior)
+            src_x, src_y                 — upwind-shifted point estimate (primary)
+            conf_radius                  — scalar confidence (sqrt(σ_maj·σ_min))
+            axis                         — (ux, uy) unit vector toward the source
+            sigma_major, sigma_minor     — plume spread along / across the axis
+            candidates                   — [(x, y, prob), ...] ranked top-3
         """
-        # Filter to positive readings — zeros tell us nothing about source location
-        pos_mask = ppm > 0.1
-        if pos_mask.sum() < 5:
-            # Not enough data — return uniform posterior
-            margin = 0.5
-            cx = np.arange(xs.min() - margin, xs.max() + margin, grid_res)
-            cy = np.arange(ys.min() - margin, ys.max() + margin, grid_res)
-            gx, gy = np.meshgrid(cx, cy)
-            posterior = np.ones(gx.shape) / gx.size
-            return posterior, gx, gy, float(np.mean(xs)), float(np.mean(ys)), 999.0
-
-        xp, yp, pp = xs[pos_mask], ys[pos_mask], ppm[pos_mask]
-
         margin = 1.0
         cx = np.arange(xs.min() - margin, xs.max() + margin, grid_res)
         cy = np.arange(ys.min() - margin, ys.max() + margin, grid_res)
         gx, gy = np.meshgrid(cx, cy)
 
-        # Characteristic length scale — based on spread of high-ppm readings
-        high_mask = pp > np.percentile(pp, 70)
-        if high_mask.sum() > 3:
-            L = max(np.std(xp[high_mask]) + np.std(yp[high_mask]), 0.5)
+        pos_mask = ppm > 0.1
+        if pos_mask.sum() < 5:
+            # Not enough signal — uniform posterior, fall back to mean position
+            posterior = np.ones(gx.shape) / gx.size
+            mx, my = float(np.mean(xs)), float(np.mean(ys))
+            return {
+                'posterior': posterior, 'gx': gx, 'gy': gy,
+                'best_x': mx, 'best_y': my, 'src_x': mx, 'src_y': my,
+                'conf_radius': 999.0, 'axis': (1.0, 0.0), 'directional': False,
+                'method': 'wind-free',
+                'low_confidence': True, 'peak_ppm': float(ppm.max()) if ppm.size else 0.0,
+                'sigma_major': 0.0, 'sigma_minor': 0.0,
+                'candidates': [(mx, my, 1.0)], 'grid_res': grid_res,
+            }
+
+        xp, yp, pp = xs[pos_mask], ys[pos_mask], ppm[pos_mask]
+        tp = (timestamps[pos_mask] if timestamps is not None
+              and len(timestamps) == len(ppm) else None)
+
+        # ── ppm²-weighted centroid + covariance (PCA for the plume axis) ──
+        w = pp.astype(np.float64) ** 2
+        w /= w.sum()
+        mu_x = float(np.sum(w * xp)); mu_y = float(np.sum(w * yp))
+        dx = xp - mu_x; dy = yp - mu_y
+        cxx = float(np.sum(w * dx * dx))
+        cyy = float(np.sum(w * dy * dy))
+        cxy = float(np.sum(w * dx * dy))
+        evals, evecs = np.linalg.eigh(np.array([[cxx, cxy], [cxy, cyy]]))
+        e_major = evecs[:, 1]                      # largest eigenvalue
+        sigma_minor = float(np.sqrt(max(evals[0], 1e-4)))
+        sigma_major = float(np.sqrt(max(evals[1], 1e-4)))
+
+        # Which end of the axis is the source? A plume has a sharp leading edge
+        # at the source and a long diffuse tail downwind. Two independent cues:
+        #   (B) ppm²-weighted skewness of the along-axis projection — the heavy
+        #       low-ppm tail sits downwind, so source = opposite the skew.
+        #   (C) spatial-extent asymmetry of positive readings — gas reaches
+        #       farther downwind, so the source is on the *shorter* side.
+        # We only trust a direction (and apply the upwind shift) when both cues
+        # agree AND the plume is clearly elongated; otherwise we keep the robust
+        # ppm²-centroid and make no directional claim. This guarantees the
+        # estimate is never pushed the wrong way by a bad sign guess.
+        proj = dx * e_major[0] + dy * e_major[1]
+        m3 = float(np.sum(w * proj ** 3))
+        sign_skew = -np.sign(m3) if m3 != 0 else 0.0
+        pp_plus, pp_minus = proj[proj > 0], proj[proj < 0]
+        ext_plus = np.percentile(pp_plus, 90) if pp_plus.size else 0.0
+        ext_minus = np.percentile(-pp_minus, 90) if pp_minus.size else 0.0
+        sign_ext = -np.sign(ext_plus - ext_minus)
+        elongated = sigma_major > 1.3 * sigma_minor
+        # Signal-quality gate: the plume axis and its sign are only meaningful
+        # when the gas was genuinely detected. For a barely-detected gas (peak
+        # near the noise floor) the PCA direction is noise, and shifting along it
+        # actively hurts — so we keep the raw ppm²-centroid instead. Threshold is
+        # set above the 2 ppm hotspot-detection floor.
+        peak_ppm = float(pp.max())
+        strong_signal = peak_ppm >= 3.0 and len(pp) >= 30
+        low_confidence = peak_ppm < 2.0
+        # Only use the aggressive wind upwind-edge for well-detected gases. For a
+        # weak gas (sparse, noise-floor) the percentile edge is unreliable, so we
+        # keep the robust ppm²-centroid instead.
+        use_wind = (use_wind_shift and wind is not None
+                    and wind_consistency >= 0.4 and not low_confidence)
+        if use_wind:
+            u = np.array(wind, dtype=float)
+            u /= max(np.linalg.norm(u), 1e-9)       # measured upwind direction → source
+            shift_confident = True
+            method = 'wind'
+        elif sign_skew != 0 and sign_skew == sign_ext and elongated and strong_signal:
+            u = e_major * sign_skew                 # unit vector → source (inferred)
+            shift_confident = True
+            method = 'wind-free'
         else:
-            L = 2.0
+            u = e_major                             # orientation only, no sign
+            shift_confident = False
+            method = 'wind-free'
 
-        # Weight each measurement by ppm² — high readings are much more informative
-        weights = pp ** 2
-        weights /= weights.sum()
+        # ── Anisotropic, axis-aligned KDE bandwidths ──
+        ell_major = max(0.6 * sigma_major, 4 * grid_res)
+        ell_minor = max(0.6 * sigma_minor, 3 * grid_res)
 
-        log_posterior = np.zeros(gx.shape)
+        # Subsample for tractable broadcasting on large datasets
+        N = len(xp)
+        if N > 1500:
+            sel = np.random.default_rng(0).choice(N, 1500, replace=False)
+        else:
+            sel = np.arange(N)
 
-        for i in range(gx.shape[0]):
-            for j in range(gx.shape[1]):
-                sx, sy = gx[i, j], gy[i, j]
-                r2 = (xp - sx) ** 2 + (yp - sy) ** 2
+        gxf = gx.ravel().astype(np.float32)
+        gyf = gy.ravel().astype(np.float32)
+        u0 = np.float32(u[0]); u1 = np.float32(u[1])
+        em = np.float32(ell_major); en = np.float32(ell_minor)
 
-                # Score 1: Weighted kernel density — high ppm near candidate = good
-                kernel = np.exp(-r2 / (2 * L ** 2))
-                score_density = np.sum(weights * kernel)
+        def aniso_density(idx):
+            """Vectorized anisotropic Gaussian KDE over the grid (ppm²-weighted)."""
+            sx = xp[idx].astype(np.float32); sy = yp[idx].astype(np.float32)
+            sw = w[idx].astype(np.float32)
+            sw = sw / max(float(sw.sum()), 1e-12)
+            ddx = gxf[:, None] - sx[None, :]
+            ddy = gyf[:, None] - sy[None, :]
+            a = ddx * u0 + ddy * u1                 # along-axis offset
+            b = -ddx * u1 + ddy * u0                # cross-axis offset
+            kern = np.exp(-0.5 * ((a / em) ** 2 + (b / en) ** 2))
+            return (kern * sw[None, :]).sum(axis=1)
 
-                # Score 2: Correlation between ppm and proximity
-                # If this is the source, closer readings should have higher ppm
-                proximity = np.exp(-r2 / (2 * (L * 1.5) ** 2))
-                score_corr = np.corrcoef(pp, proximity)[0, 1] if len(pp) > 2 else 0.0
-                score_corr = max(score_corr, 0.0)  # negative correlation = not source
+        if tp is not None and N >= 60:
+            # Geometric mean across time bins → reward persistent hotspots
+            order = np.argsort(tp)
+            bins = np.array_split(order, 3)
+            log_acc = np.zeros(gxf.shape, dtype=np.float64)
+            used = 0
+            for b_idx in bins:
+                b_sel = np.intersect1d(b_idx, sel) if N > 1500 else b_idx
+                if len(b_sel) < 5:
+                    b_sel = b_idx
+                d = aniso_density(b_sel).astype(np.float64)
+                d /= max(d.sum(), 1e-12)
+                log_acc += np.log(d + 1e-9)
+                used += 1
+            dens = np.exp(log_acc / max(used, 1))
+        else:
+            dens = aniso_density(sel).astype(np.float64)
 
-                log_posterior[i, j] = np.log(score_density + 1e-20) + 2.0 * score_corr
+        posterior = np.clip(dens.reshape(gx.shape), 0, None)
+        psum = posterior.sum()
+        posterior = (posterior / psum) if psum > 0 else np.ones_like(posterior) / posterior.size
 
-        # Temper the posterior to avoid collapse (effective temperature)
-        log_posterior -= np.max(log_posterior)
-        temperature = 0.5  # higher = smoother posterior
-        posterior = np.exp(log_posterior / temperature)
-        posterior /= posterior.sum()
+        pr, pc = np.unravel_index(np.argmax(posterior), posterior.shape)
+        best_x, best_y = float(gx[pr, pc]), float(gy[pr, pc])
 
-        # MAP estimate
-        peak_idx = np.argmax(posterior)
-        peak_r, peak_c = np.unravel_index(peak_idx, posterior.shape)
-        best_x = float(gx[peak_r, peak_c])
-        best_y = float(gy[peak_r, peak_c])
+        # Shift the ppm²-weighted centroid upwind toward the source. The
+        # MEASURED wind gives a reliable direction, so we shift a full ~1σ
+        # (the upwind extent of the plume bulk). The wind-free inferred
+        # direction is less trustworthy, so it shifts more conservatively, and
+        # only when confident. A bounded shift is used rather than the upwind
+        # *edge* (percentile), which overshoots badly when gas diffuses against
+        # the mean wind.
+        if use_wind:
+            shift = 1.0 * sigma_major
+        else:
+            shift = 0.6 * sigma_major if shift_confident else 0.0
+        src_x = float(mu_x + shift * u[0])
+        src_y = float(mu_y + shift * u[1])
 
-        # Confidence radius (sqrt of weighted variance around MAP)
-        dx = gx - best_x
-        dy = gy - best_y
-        r2 = dx ** 2 + dy ** 2
-        confidence_radius = float(np.sqrt(np.sum(posterior * r2)))
+        return {
+            'posterior': posterior, 'gx': gx, 'gy': gy,
+            'best_x': best_x, 'best_y': best_y,
+            'src_x': src_x, 'src_y': src_y,
+            'conf_radius': float(np.sqrt(max(sigma_major * sigma_minor, 1e-4))),
+            'axis': (float(u[0]), float(u[1])),
+            'directional': bool(shift_confident), 'method': method,
+            'low_confidence': bool(low_confidence), 'peak_ppm': peak_ppm,
+            'sigma_major': sigma_major, 'sigma_minor': sigma_minor,
+            'candidates': self._top_candidates(posterior, gx, gy, n=3),
+            'grid_res': grid_res,
+        }
 
-        return posterior, gx, gy, best_x, best_y, confidence_radius
+    def _compute_localization_metrics(self):
+        """Build benchmark metrics: localization error vs. ground truth,
+        detection latency, path length and coverage efficiency.
+        Populates self._metrics; requires self._loc_results to be filled."""
+        if self._true_sources is None:
+            self._true_sources = self._parse_true_sources()
+        metrics = {}
+
+        # Path length (longest sensor trace ≈ robot path)
+        path_len = 0.0
+        for t, d in self.dataset.items():
+            x = np.array(d['x']); y = np.array(d['y'])
+            if len(x) > 1:
+                path_len = max(path_len, float(np.sum(np.hypot(np.diff(x), np.diff(y)))))
+        metrics['path_length_m'] = path_len
+        if hasattr(self, '_coverage_pct') and path_len > 0:
+            metrics['coverage_pct_per_m'] = float(self._coverage_pct) / path_len
+
+        # Per-gas localization error vs. nearest true source
+        per_gas = {}
+        for clean, r in self._loc_results.items():
+            entry = {
+                'src_x': r['src_x'], 'src_y': r['src_y'],
+                'best_x': r['best_x'], 'best_y': r['best_y'],
+                'conf_radius': r['conf_radius'],
+                'low_confidence': bool(r.get('low_confidence', False)),
+                'peak_ppm': float(r.get('peak_ppm', 0.0)),
+                'method': r.get('method', 'wind-free'),
+            }
+            if self._true_sources:
+                # Match this sensor to its own source: the launch file pairs
+                # gasN ↔ simN (gas1=ethanol=sim1, gas2=methane=sim2, …). Fall
+                # back to the nearest source only when no simN match exists,
+                # otherwise a wrong-but-closer source gives a misleadingly small
+                # error (e.g. methane matched to a nearby hydrogen source).
+                gas_label = clean.split('_')[0]          # e.g. 'gas2'
+                sim_name = gas_label.replace('gas', 'sim') if gas_label.startswith('gas') else None
+                tgt = next((s for s in self._true_sources if s['name'] == sim_name), None)
+                if tgt is None:
+                    tgt = min(self._true_sources,
+                              key=lambda s: math.hypot(r['src_x'] - s['x'], r['src_y'] - s['y']))
+                entry['error_m'] = float(math.hypot(r['src_x'] - tgt['x'], r['src_y'] - tgt['y']))
+                entry['map_error_m'] = float(math.hypot(
+                    r['best_x'] - tgt['x'], r['best_y'] - tgt['y']))
+                entry['true_x'] = tgt['x']; entry['true_y'] = tgt['y']
+                entry['true_name'] = tgt['name']
+            per_gas[clean] = entry
+        metrics['per_gas'] = per_gas
+
+        # Detection latency: time from first sample to first reading > 2 ppm
+        latency = {}
+        for t, d in self.dataset.items():
+            clean = t.replace('/', '_').strip('_')
+            ppm = np.array(d['ppm']); ts = np.array(d['timestamp'])
+            if len(ppm) == 0 or len(ts) == 0:
+                continue
+            above = np.where(ppm > 2.0)[0]
+            latency[clean] = float(ts[above[0]] - ts[0]) if len(above) else None
+        metrics['detection_latency_s'] = latency
+
+        self._metrics = metrics
+        return metrics
+
+    def _save_benchmark_plot(self, out):
+        """Benchmark figure: predicted source estimates vs. ground-truth sources.
+
+        Left panel: spatial map with true sources, predicted estimates and the
+        error vector connecting each prediction to its nearest true source.
+        Right panel: per-gas localization-error bar chart.
+        """
+        if self._true_sources is None:
+            self._true_sources = self._parse_true_sources()
+        per_gas = self._metrics.get('per_gas', {})
+        errs = {k: v['error_m'] for k, v in per_gas.items() if 'error_m' in v}
+        if not self._true_sources or not errs:
+            print("  Benchmark plot skipped (no ground-truth sources or estimates).")
+            return
+
+        fig, (axm, axb) = plt.subplots(1, 2, figsize=(18, 8),
+                                       gridspec_kw={'width_ratios': [1.4, 1]})
+
+        # Occupancy walls for spatial context
+        if self.map_data is not None and self.map_info is not None:
+            info = self.map_info
+            w, h = info.width, info.height
+            raw = np.array(self.map_data, dtype=float).reshape((h, w))
+            occ = np.zeros((h, w, 4), dtype=float)
+            occ[raw >= 50] = [0, 0, 0, 1.0]
+            ox, oy = info.origin.position.x, info.origin.position.y
+            axm.imshow(occ, extent=[ox, ox + w * info.resolution,
+                                    oy, oy + h * info.resolution],
+                       origin='lower', interpolation='nearest', zorder=5)
+
+        for s in self._true_sources:
+            axm.plot(s['x'], s['y'], 'P', markersize=15, color='#ff1493',
+                     markeredgecolor='white', markeredgewidth=1.0, zorder=8)
+            axm.text(s['x'], s['y'], f"  {s['name']}", color='#ff1493',
+                     fontsize=8, zorder=8)
+        axm.plot([], [], 'P', color='#ff1493', label='True source')
+
+        colors = plt.cm.viridis(np.linspace(0.1, 0.9, max(len(per_gas), 1)))
+        for (clean, e), col in zip(per_gas.items(), colors):
+            if 'error_m' not in e:
+                continue
+            axm.plot(e['src_x'], e['src_y'], '*', markersize=16, color=col,
+                     markeredgecolor='black', markeredgewidth=0.6, zorder=7,
+                     label=f"{clean} (err {e['error_m']:.2f}m)")
+            axm.plot([e['src_x'], e['true_x']], [e['src_y'], e['true_y']],
+                     color=col, linestyle=':', linewidth=1.4, alpha=0.9, zorder=6)
+
+        axm.set_xlabel('X (m)'); axm.set_ylabel('Y (m)')
+        axm.set_title('Predicted vs. Actual Source Locations')
+        axm.legend(loc='upper right', fontsize=8)
+        axm.set_aspect('equal')
+
+        # Error bar chart
+        names = list(errs.keys())
+        vals = [errs[n] for n in names]
+        bars = axb.bar(range(len(names)), vals, color=colors[:len(names)],
+                       edgecolor='black', linewidth=0.6)
+        mean_err = float(np.mean(vals))
+        axb.axhline(mean_err, color='#c0392b', linestyle='--', linewidth=1.3,
+                    label=f'Mean = {mean_err:.2f} m')
+        for b, v in zip(bars, vals):
+            axb.text(b.get_x() + b.get_width() / 2, v, f'{v:.2f}',
+                     ha='center', va='bottom', fontsize=9)
+        axb.set_xticks(range(len(names)))
+        axb.set_xticklabels(names, rotation=30, ha='right', fontsize=8)
+        axb.set_ylabel('Localization error (m)')
+        axb.set_title('Localization Error per Gas')
+        axb.legend(fontsize=9)
+        axb.grid(True, axis='y', alpha=0.2)
+
+        fig.suptitle('Source Localization Benchmark', fontsize=15, fontweight='bold')
+        fig.tight_layout()
+        fig.savefig(os.path.join(out, 'benchmark_localization.png'), dpi=250)
+        plt.close(fig)
+        print(f"Saved benchmark plot -> {out}/benchmark_localization.png "
+              f"(mean error {mean_err:.2f} m)")
 
     # ────────────────────────────────────────────────────────────
     #  Plotting — viridis theme, research-ready
@@ -1444,6 +2025,7 @@ class AutoCoverageMapper(Node):
         from scipy.spatial import cKDTree
         from scipy.ndimage import gaussian_filter
         from matplotlib.colors import LogNorm, PowerNorm
+        from matplotlib.patches import Ellipse
         from matplotlib_scalebar.scalebar import ScaleBar
 
         CMAP = 'viridis'
@@ -1720,8 +2302,8 @@ class AutoCoverageMapper(Node):
 
             # ── 8) CUSUM detection ──
             cusum_trace = []
-            cw, ck, ch = self._cusum_params
-            cusum_plot = CUSUMDetector(warmup=cw, k=ck, h=ch)
+            cw, ck, ch, cnf = self._cusum_params
+            cusum_plot = CUSUMDetector(warmup=cw, k=ck, h=ch, noise_floor=cnf)
             spike_regions = []
             in_spike = False
             for i, val in enumerate(ppm):
@@ -1787,9 +2369,17 @@ class AutoCoverageMapper(Node):
             fig.savefig(os.path.join(out, f'{clean}_dashboard.png'), dpi=250)
             plt.close(fig)
 
-            # ── 10) Source Localization ──
+            # ── 10) Source Localization (probability distribution) ──
             print(f"Running source localization for {t}...")
-            posterior, gx, gy, best_x, best_y, conf_r = self._estimate_source(xs, ys, ppm)
+            # Reuse the result computed in _save_data when available (keeps the
+            # saved NPZ and the figure perfectly consistent).
+            r = self._loc_results.get(clean)
+            if r is None:
+                r = self._estimate_source(xs, ys, ppm, timestamps=np.array(d['timestamp']))
+            posterior, gx, gy = r['posterior'], r['gx'], r['gy']
+            src_x, src_y = r['src_x'], r['src_y']
+            sig_maj, sig_min = r['sigma_major'], r['sigma_minor']
+            ux, uy = r['axis']
 
             fig, ax = plt.subplots(figsize=(10, 8))
             post_max = max(np.max(posterior), 1e-10)
@@ -1803,32 +2393,103 @@ class AutoCoverageMapper(Node):
             plt.colorbar(plt.cm.ScalarMappable(cmap=CMAP, norm=norm_post),
                          ax=ax, label='P(source)', shrink=0.82)
 
-            ax.plot(best_x, best_y, 'r*', markersize=18, markeredgecolor='white',
-                    markeredgewidth=1.0, label=f'Estimate: ({best_x:.2f}, {best_y:.2f})', zorder=6)
-            theta = np.linspace(0, 2 * np.pi, 100)
-            ax.plot(best_x + conf_r * np.cos(theta), best_y + conf_r * np.sin(theta),
-                    'w--', linewidth=1.5, alpha=0.8, label=f'1\u03c3: {conf_r:.2f}m', zorder=6)
+            # ── Credible "search region": smallest area holding 50% of the
+            # posterior mass. This is the primary deliverable — "look here".
+            flat = posterior.ravel()
+            order = np.argsort(flat)[::-1]
+            csum = np.cumsum(flat[order])
+            csum /= csum[-1]
+            k50 = np.searchsorted(csum, 0.50)
+            thr50 = flat[order[min(k50, len(order) - 1)]]
+            try:
+                cs = ax.contour(gx, gy, posterior, levels=[thr50],
+                                colors=['#ff3b3b'], linewidths=2.0, zorder=6)
+                ax.plot([], [], color='#ff3b3b', lw=2.0,
+                        label='50% search region')
+            except Exception:
+                pass
+
+            # Anisotropic confidence ellipse aligned to the recovered plume axis
+            ang = math.degrees(math.atan2(uy, ux))
+            ellipse = Ellipse((src_x, src_y), width=2 * sig_maj, height=2 * sig_min,
+                              angle=ang, fill=False, edgecolor='white',
+                              linestyle='--', linewidth=1.5, alpha=0.85, zorder=6)
+            ax.add_patch(ellipse)
+
+            # Recovered plume axis. If the source direction is confident, draw a
+            # one-way arrow toward the source (upwind); otherwise just show the
+            # undirected axis line (we know the orientation, not which end).
+            alen = max(sig_maj, 0.5)
+            if r.get('directional'):
+                ax.annotate('', xy=(src_x + ux * alen, src_y + uy * alen),
+                            xytext=(src_x - ux * alen, src_y - uy * alen),
+                            arrowprops=dict(arrowstyle='-|>', color='#00e5ff',
+                                            lw=2.0, alpha=0.9), zorder=6)
+                ax.text(src_x - ux * alen, src_y - uy * alen, ' downwind',
+                        color='#00e5ff', fontsize=8, alpha=0.9, zorder=7)
+            else:
+                ax.plot([src_x - ux * alen, src_x + ux * alen],
+                        [src_y - uy * alen, src_y + uy * alen],
+                        color='#00e5ff', lw=1.8, alpha=0.8, zorder=6,
+                        label='Plume axis (direction unknown)')
+
+            # Best-guess centre of the region + ranked candidate spots
+            ax.plot(src_x, src_y, 'r*', markersize=18, markeredgecolor='white',
+                    markeredgewidth=1.0, zorder=7,
+                    label=f'Best guess: ({src_x:.2f}, {src_y:.2f})')
+            for rank, (cxv, cyv, _) in enumerate(r['candidates'][:3], 1):
+                ax.plot(cxv, cyv, 'o', markersize=9, markerfacecolor='none',
+                        markeredgecolor='yellow', markeredgewidth=1.5, zorder=6)
+                ax.text(cxv, cyv, f' #{rank}', color='yellow', fontsize=9,
+                        fontweight='bold', zorder=7)
 
             max_ppm_idx = np.argmax(ppm)
             ax.plot(xs[max_ppm_idx], ys[max_ppm_idx], 'w^', markersize=10,
                     markeredgecolor='black', markeredgewidth=0.5,
                     label='Max reading', zorder=6)
 
+            # Ground-truth source(s) + error annotation (benchmark overlay)
+            if self._true_sources is None:
+                self._true_sources = self._parse_true_sources()
+            err_txt = ''
+            for s in self._true_sources:
+                ax.plot(s['x'], s['y'], 'P', markersize=13, color='#ff1493',
+                        markeredgecolor='white', markeredgewidth=0.8, zorder=8)
+            entry = self._metrics.get('per_gas', {}).get(clean, {})
+            if 'error_m' in entry:
+                tx, ty = entry['true_x'], entry['true_y']
+                ax.plot([src_x, tx], [src_y, ty], color='#ff1493',
+                        linestyle=':', linewidth=1.3, alpha=0.9, zorder=7)
+                err_txt = f"  |  error = {entry['error_m']:.2f} m"
+                ax.plot([], [], 'P', color='#ff1493',
+                        label=f'True source ({tx:.2f}, {ty:.2f})')
+
             _scalebar(ax)
             ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)')
-            ax.set_title('Source Localization (Bayesian)')
-            ax.legend(loc='upper right', fontsize=9)
+            meth = r.get('method', 'wind-free')
+            title = f'Source Region ({meth}) \u2014 P(source) + 50% search region' + err_txt
+            if r.get('low_confidence'):
+                title += f"\n[!] LOW CONFIDENCE \u2014 peak only {r.get('peak_ppm', 0):.2f} ppm (gas barely detected)"
+            ax.set_title(title)
+            ax.legend(loc='upper right', fontsize=8)
             ax.set_aspect('equal')
             fig.tight_layout()
             fig.savefig(os.path.join(out, f'{clean}_source_localization.png'), dpi=250)
             plt.close(fig)
 
             print(
-                f"  Source estimate: ({best_x:.2f}, {best_y:.2f}) \u00b1 {conf_r:.2f}m\n"
-                f"  Max-reading at ({xs[max_ppm_idx]:.2f}, {ys[max_ppm_idx]:.2f})"
+                f"  Source estimate: ({src_x:.2f}, {src_y:.2f}), "
+                f"plume axis=({ux:.2f}, {uy:.2f}), \u03c3=({sig_maj:.2f}, {sig_min:.2f})m"
+                + (f", error={entry['error_m']:.2f}m" if 'error_m' in entry else '')
             )
 
             print(f"Saved 10 plots for {t} -> {out}")
+
+        # \u2500\u2500 Cross-gas localization benchmark (predicted vs. actual) \u2500\u2500
+        try:
+            self._save_benchmark_plot(out)
+        except Exception as e:
+            print(f"  Warning: benchmark plot failed: {e}")
 
 
 def main(args=None):

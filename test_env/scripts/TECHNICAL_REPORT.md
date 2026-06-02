@@ -278,7 +278,7 @@ This is numerically stable, requires O(1) memory per cell, and computes the exac
 
 ## 5. Bayesian Source Localization
 
-Both mappers implement an identical algorithm, run once at mission end over all collected `(x, y, ppm)` data.
+The estimator lives in the shared, ROS-free module `gas_viz.estimate_source` — used live by `auto_coverage_mapper` at mission end and offline by `plot_from_npz` / the synthetic-run harness, so the *identical* algorithm runs in both places. It runs once over all collected `(x, y, ppm)` data per gas and returns a probability **region** (a posterior over source location) plus ranked candidates and 50% / 90% credible (HPD) areas — deliberately *not* a single false pinpoint.
 
 ### 5.1 Forward Model
 
@@ -339,7 +339,21 @@ sigma_r  =  sqrt( sum_s  P(s | C_obs) * ||s - s_hat||^2 )
 
 This is the posterior root-mean-square distance from the MAP — a single scalar summarising how concentrated the belief is spatially.
 
-The posterior grid is computed at `0.15 m` resolution over the full map extent. This is an `O(N * M)` batch computation (N grid cells × M measurements), executed once at mission end.
+The posterior grid is computed at `0.10 m` resolution over the full map extent. This is an `O(N * M)` batch computation (N grid cells × M measurements), executed once at mission end.
+
+### 5.4 Calibration improvements (current implementation)
+
+Four changes make the posterior an honest *region* rather than an over-confident dot, and remove three biases noted in earlier versions:
+
+1. **All readings, including near-zero.** The likelihood uses every sample, not only positive ones: the *absence* of gas constrains where the source can be (a candidate that predicts gas where none was measured is penalised).
+
+2. **Spatial binning.** Readings are binned to one observation per `0.20 m` cell before the inversion. The robot dwells unevenly along its path; without this, oversampled locations would dominate the likelihood and collapse the posterior to a false pinpoint. Each surveyed location now contributes once.
+
+3. **Empirical-Bayes, scale-invariant noise.** Instead of an absolute sensor `sigma_n`, the likelihood is scaled by the best-fit residual level `chi2_min` (an MLE of the effective noise). The posterior *shape* then depends only on the relative goodness-of-fit across candidates — invariant to signal amplitude, sample count and baseline noise. When the `1/r` model fits poorly (real-plume mismatch) `chi2_min` is large and the region honestly widens. The CUSUM-learned baseline `sigma` (exported per gas in the NPZ) provides a floor, replacing the old "median of all readings" estimator that over-counted plume samples.
+
+4. **Power likelihood (`eff_obs`).** The exponent is weighted by an *effective number of independent spatial observations* (`eff_obs ≈ 20`) rather than the raw, autocorrelated sample count, so the credible-region size reflects genuine uncertainty rather than survey density. `eff_obs` is the single knob for region size.
+
+**Optional wind advection.** When a measured wind is supplied and consistent (`wind_consistency ≥ 0.4`, `use_wind_shift=True`), the forward model is evaluated at `s − û·tau`: gas released at `s` is transported downwind before measurement, which moves posterior mass *upwind* toward the true source. Off by default (turbulent indoor fields make a single mean-wind vector unreliable); the wind-free `1/r` inversion is the default.
 
 ---
 
@@ -376,6 +390,16 @@ Contains per-topic NumPy arrays `(x, y, ppm, timestamps)`, Bayesian posterior gr
 | 7 | `_bayesian.png` | Posterior heatmap + MAP point + confidence circle |
 
 Concentration mapper outputs go to `~/gaden_results/concentration_maps/`.
+
+#### Decision-ready per-gas maps (`gas_viz`, emitted live and by `plot_from_npz`)
+
+| Filename suffix | Content |
+|-----------------|---------|
+| `_concentration_intensity.png` | **Where the gas peaks** — turbo heatmap with data-relative intensity bands (trace → PEAK) auto-scaled per gas, a highlighted peak region, unsurveyed area hatched, walls overlaid. The "good middle ground" between a binary hazard map and the raw research plots. |
+| `_source_localization.png` | **Probabilistic source REGION** — `P(source)` posterior with 50% / 90% credible (HPD) contours, ranked candidates and plume axis. A region, not a pinpoint. |
+| `benchmark_localization.png` | Predicted vs. ground-truth sources + per-gas error bars. |
+
+Regenerate offline from a finished run with `python3 plot_from_npz.py <run_dir> <scenario_path> [--recompute]` (ROS-free). `make_synthetic_run.py` fabricates a schema-compatible `run_data.npz` for testing the renderers without GADEN. The combined cross-gas hazard overview + situation report remains in `risk_map_prototype.py`.
 
 ---
 
@@ -458,17 +482,17 @@ Both mappers look up `map → base_link` (or `map → PioneerP3DX_base_link`) at
 
 ### Known Limitations
 
-**1. Source localization model mismatch**
+**1. Source localization model mismatch** *(partially addressed)*
 
-The Bayesian forward model assumes `C ∝ 1/r` (isotropic steady-state diffusion, no wind). GADEN produces anisotropic, time-varying, wind-advected plumes. The posterior will be systematically biased in the downwind direction. A minimal improvement would be to incorporate the mean wind direction as an advection offset: `C_pred(s, p) ≈ A / (||s + v_wind * tau - p|| + eps)`.
+The forward model assumes `C ∝ 1/r` (isotropic steady-state diffusion); GADEN produces anisotropic, time-varying, wind-advected plumes, so the wind-free posterior can still bias downwind. Two mitigations are now in place (§5.4): the optional wind-advection offset `C_pred(s, p) ≈ A / (||s − û·tau − p|| + eps)` when a consistent wind is measured, and the empirical-Bayes noise scaling that *widens* the credible region precisely when model mismatch is large (so the reported region stays honest rather than confidently wrong).
 
 **2. Sensor lag vs. spatial stamping**
 
 MOX sensors have time constants of 5–20 seconds. At `0.3 m/s` with `tau_decay = 18 s`, the 63%-rise-time position error is approximately `0.3 * 18 = 5.4 m` — larger than the hotspot merge radius of `1.5 m`. Readings are stamped at the robot's *current* position when the message is received, not where the gas encounter actually occurred. The reactive slowdown partially compensates this but only after the CUSUM has already fired.
 
-**3. Noise variance estimation**
+**3. Noise variance estimation** *(addressed)*
 
-`sigma_n` for the Bayesian posterior is estimated from the median of *all* observations, including high-concentration samples. This overestimates noise far from the source and underestimates it near it, causing an incorrectly weighted likelihood. Noise should be estimated from pre-gas baseline samples only (e.g., the CUSUM warmup window).
+Earlier versions estimated `sigma_n` from the median of *all* observations, including plume samples. The current estimator (§5.4) instead floors the noise at the CUSUM-learned **pre-gas baseline** `sigma` (exported per gas in the NPZ) and scales the likelihood by the empirical best-fit residual `chi2_min`, so the posterior shape no longer depends on that biased global statistic.
 
 **4. Phase 1 exit condition**
 

@@ -25,6 +25,11 @@ from matplotlib.patches import Polygon
 from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
 
+# Shared wall-loader (and other helpers) so this companion view stays consistent
+# with the per-gas intensity / source maps emitted by plot_from_npz.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gas_viz
+
 # Per-gas exposure thresholds (ppm): [elevated, hazard].
 # Illustrative bands so the demo is meaningful at the sim's ppm scale; in a real
 # deployment these come from each gas's exposure limit (e.g. OSHA PEL/IDLH).
@@ -38,20 +43,7 @@ DEFAULT_BANDS = (1.0, 5.0)
 
 
 def load_walls(run_dir):
-    pgm = os.path.join(run_dir, 'occupancy_grid.pgm')
-    yml = os.path.join(run_dir, 'occupancy_grid.yaml')
-    if not (os.path.isfile(pgm) and os.path.isfile(yml)):
-        return None, None
-    import yaml
-    meta = yaml.safe_load(open(yml))
-    res = float(meta['resolution']); ox, oy = float(meta['origin'][0]), float(meta['origin'][1])
-    with open(pgm, 'rb') as f:
-        assert f.readline().strip() == b'P5'
-        w, h = map(int, f.readline().split()); f.readline()
-        data = np.frombuffer(f.read(), dtype=np.uint8).reshape((h, w))
-    data = np.flipud(data)
-    rgba = np.zeros((h, w, 4)); rgba[data <= 50] = [0, 0, 0, 1.0]
-    return rgba, [ox, ox + w * res, oy, oy + h * res]
+    return gas_viz.load_walls(run_dir)
 
 
 def main(run_dir):

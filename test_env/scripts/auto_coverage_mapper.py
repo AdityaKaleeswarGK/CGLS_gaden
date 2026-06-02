@@ -14,6 +14,7 @@ variance from the first N samples, so no hardcoded ppm thresholds are
 needed for spike detection.
 """
 import os
+import sys
 import csv
 import time
 import math
@@ -24,6 +25,10 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+# Shared, ROS-free analysis & visualization (estimator + figures), reused by the
+# offline renderers so live and offline output stay identical.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gas_viz
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
@@ -114,6 +119,18 @@ class CUSUMDetector:
     @property
     def threshold(self) -> float:
         return self._threshold
+
+    @property
+    def baseline_mu(self) -> float:
+        """Calibrated baseline (pre-gas) mean — exported for the source-likelihood
+        noise model and the concentration-intensity 'trace' band."""
+        return self._mu
+
+    @property
+    def baseline_sigma(self) -> float:
+        """Calibrated baseline (pre-gas) std — the honest noise scale, used in
+        place of the global median (which over-counts plume samples)."""
+        return self._sigma
 
     def _calibrate(self):
         arr = np.array(self._samples)
@@ -1551,12 +1568,19 @@ class AutoCoverageMapper(Node):
             if len(xs) > 10:
                 # Per-gas LOCAL wind (the field is non-uniform); fall back to
                 # the global mean only if there isn't enough local wind data.
+                # CUSUM's calibrated baseline sigma is the honest sensor-noise
+                # scale for the source-likelihood (vs. the global median, which
+                # over-counts plume samples — see report §9.3).
+                cusum = self._cusums.get(t)
+                bsig = (cusum.baseline_sigma
+                        if (cusum is not None and cusum.is_calibrated()) else None)
                 lw = self._local_wind(xs, ys_arr, ppm_arr)
                 g_up = lw[0] if lw else wind_up
                 g_cons = lw[2] if lw else wind_cons
                 r = self._estimate_source(xs, ys_arr, ppm_arr, timestamps=ts_arr,
                                           wind=g_up, wind_consistency=g_cons,
-                                          use_wind_shift=self.use_wind_shift)
+                                          use_wind_shift=self.use_wind_shift,
+                                          baseline_sigma=bsig)
                 self._loc_results[clean] = r
                 if g_up is not None:
                     save_dict[f'{clean}_wind_upwind_xy'] = np.array(g_up)
@@ -1574,6 +1598,11 @@ class AutoCoverageMapper(Node):
                 save_dict[f'{clean}_low_confidence'] = np.array(r.get('low_confidence', False))
                 save_dict[f'{clean}_peak_ppm'] = np.array(r.get('peak_ppm', 0.0))
                 save_dict[f'{clean}_method'] = np.array(r.get('method', 'wind-free'))
+                # Export the CUSUM baseline so offline tools reproduce the same
+                # likelihood noise model and intensity 'trace' band.
+                if cusum is not None and cusum.is_calibrated():
+                    save_dict[f'{clean}_baseline_mu'] = np.array(cusum.baseline_mu)
+                    save_dict[f'{clean}_baseline_sigma'] = np.array(cusum.baseline_sigma)
 
         # Localization benchmark metrics (error vs. ground truth, latency, …)
         self._compute_localization_metrics()
@@ -1653,229 +1682,24 @@ class AutoCoverageMapper(Node):
         return sources
 
     # ────────────────────────────────────────────────────────────
-    #  Wind-free probabilistic Source Localization
+    #  Probabilistic source localization (delegated to gas_viz)
     # ────────────────────────────────────────────────────────────
-    def _top_candidates(self, posterior, gx, gy, n=3, min_sep=0.8):
-        """Return up to N well-separated posterior maxima as ranked candidates:
-        [(x, y, probability), ...] sorted high→low."""
-        order = np.argsort(posterior.ravel())[::-1]
-        cands = []
-        for idx in order:
-            r, c = np.unravel_index(idx, posterior.shape)
-            x, y, p = float(gx[r, c]), float(gy[r, c]), float(posterior[r, c])
-            if all(math.hypot(x - cx, y - cy) > min_sep for cx, cy, _ in cands):
-                cands.append((x, y, p))
-            if len(cands) >= n:
-                break
-        return cands
-
-    def _estimate_source(self, xs, ys, ppm, timestamps=None, grid_res=0.08,
-                         wind=None, wind_consistency=0.0, use_wind_shift=False):
+    def _estimate_source(self, xs, ys, ppm, timestamps=None, grid_res=0.10,
+                         wind=None, wind_consistency=0.0, use_wind_shift=False,
+                         baseline_sigma=None):
         """Probabilistic gas-source-REGION localization.
 
-        Primary output is a probability *region* (the posterior) plus ranked
-        candidate cells — "where to look" — not a false pinpoint. The point
-        estimate defaults to the robust ppm²-weighted centroid of the detected
-        gas (the accumulation region).
-
-        Optional (`use_wind_shift=True`): when a measured wind direction is
-        available and consistent, the centroid is nudged ~1σ upwind. This helps
-        on steady wind but can hurt on turbulent/dynamic fields, so it is OFF by
-        default.
-
-        Without wind it falls back to the wind-free method below.
-
-        Without an anemometer we cannot back-track along the wind, so rather
-        than claim a single point (false precision) we return a *probability
-        distribution* over source location, plus a best-guess point and a
-        ranked list of candidate spots.
-
-        Method:
-          1. Use only positive readings, weighted by ppm**2 (concentration
-             peaks are far more informative than the diffuse tail).
-          2. Recover the plume's principal axis from the data via a
-             ppm**2-weighted PCA. A plume is elongated along the wind; its
-             high-concentration end is the source and the long diffuse tail is
-             downwind. This recovers an *approximate wind axis with no
-             anemometer*.
-          3. Build an anisotropic (axis-aligned) kernel-density posterior,
-             combined across time bins by geometric mean so that only spots
-             that are *persistently* gassy score highly — a real leak is
-             stationary, while plume meander averages out.
-          4. The point estimate is the ppm**2-weighted centroid nudged upwind
-             (toward the high-concentration end) to de-bias the systematic
-             downwind offset of the raw peak/centroid.
-
-        Returns a dict with keys:
-            posterior, gx, gy            — the probability distribution
-            best_x, best_y               — MAP (argmax of posterior)
-            src_x, src_y                 — upwind-shifted point estimate (primary)
-            conf_radius                  — scalar confidence (sqrt(σ_maj·σ_min))
-            axis                         — (ux, uy) unit vector toward the source
-            sigma_major, sigma_minor     — plume spread along / across the axis
-            candidates                   — [(x, y, prob), ...] ranked top-3
+        Thin wrapper over the shared, ROS-free estimator in ``gas_viz`` so the
+        identical algorithm runs live and offline (``plot_from_npz --recompute``
+        and the synthetic-run harness). Returns a genuine ``P(source | readings)``
+        posterior REGION (1/r Bayesian inversion with analytic release-rate
+        marginalization) plus 50% / 90% HPD areas — see
+        ``gas_viz.estimate_source`` for the full model.
         """
-        margin = 1.0
-        cx = np.arange(xs.min() - margin, xs.max() + margin, grid_res)
-        cy = np.arange(ys.min() - margin, ys.max() + margin, grid_res)
-        gx, gy = np.meshgrid(cx, cy)
-
-        pos_mask = ppm > 0.1
-        if pos_mask.sum() < 5:
-            # Not enough signal — uniform posterior, fall back to mean position
-            posterior = np.ones(gx.shape) / gx.size
-            mx, my = float(np.mean(xs)), float(np.mean(ys))
-            return {
-                'posterior': posterior, 'gx': gx, 'gy': gy,
-                'best_x': mx, 'best_y': my, 'src_x': mx, 'src_y': my,
-                'conf_radius': 999.0, 'axis': (1.0, 0.0), 'directional': False,
-                'method': 'wind-free',
-                'low_confidence': True, 'peak_ppm': float(ppm.max()) if ppm.size else 0.0,
-                'sigma_major': 0.0, 'sigma_minor': 0.0,
-                'candidates': [(mx, my, 1.0)], 'grid_res': grid_res,
-            }
-
-        xp, yp, pp = xs[pos_mask], ys[pos_mask], ppm[pos_mask]
-        tp = (timestamps[pos_mask] if timestamps is not None
-              and len(timestamps) == len(ppm) else None)
-
-        # ── ppm²-weighted centroid + covariance (PCA for the plume axis) ──
-        w = pp.astype(np.float64) ** 2
-        w /= w.sum()
-        mu_x = float(np.sum(w * xp)); mu_y = float(np.sum(w * yp))
-        dx = xp - mu_x; dy = yp - mu_y
-        cxx = float(np.sum(w * dx * dx))
-        cyy = float(np.sum(w * dy * dy))
-        cxy = float(np.sum(w * dx * dy))
-        evals, evecs = np.linalg.eigh(np.array([[cxx, cxy], [cxy, cyy]]))
-        e_major = evecs[:, 1]                      # largest eigenvalue
-        sigma_minor = float(np.sqrt(max(evals[0], 1e-4)))
-        sigma_major = float(np.sqrt(max(evals[1], 1e-4)))
-
-        # Which end of the axis is the source? A plume has a sharp leading edge
-        # at the source and a long diffuse tail downwind. Two independent cues:
-        #   (B) ppm²-weighted skewness of the along-axis projection — the heavy
-        #       low-ppm tail sits downwind, so source = opposite the skew.
-        #   (C) spatial-extent asymmetry of positive readings — gas reaches
-        #       farther downwind, so the source is on the *shorter* side.
-        # We only trust a direction (and apply the upwind shift) when both cues
-        # agree AND the plume is clearly elongated; otherwise we keep the robust
-        # ppm²-centroid and make no directional claim. This guarantees the
-        # estimate is never pushed the wrong way by a bad sign guess.
-        proj = dx * e_major[0] + dy * e_major[1]
-        m3 = float(np.sum(w * proj ** 3))
-        sign_skew = -np.sign(m3) if m3 != 0 else 0.0
-        pp_plus, pp_minus = proj[proj > 0], proj[proj < 0]
-        ext_plus = np.percentile(pp_plus, 90) if pp_plus.size else 0.0
-        ext_minus = np.percentile(-pp_minus, 90) if pp_minus.size else 0.0
-        sign_ext = -np.sign(ext_plus - ext_minus)
-        elongated = sigma_major > 1.3 * sigma_minor
-        # Signal-quality gate: the plume axis and its sign are only meaningful
-        # when the gas was genuinely detected. For a barely-detected gas (peak
-        # near the noise floor) the PCA direction is noise, and shifting along it
-        # actively hurts — so we keep the raw ppm²-centroid instead. Threshold is
-        # set above the 2 ppm hotspot-detection floor.
-        peak_ppm = float(pp.max())
-        strong_signal = peak_ppm >= 3.0 and len(pp) >= 30
-        low_confidence = peak_ppm < 2.0
-        # Only use the aggressive wind upwind-edge for well-detected gases. For a
-        # weak gas (sparse, noise-floor) the percentile edge is unreliable, so we
-        # keep the robust ppm²-centroid instead.
-        use_wind = (use_wind_shift and wind is not None
-                    and wind_consistency >= 0.4 and not low_confidence)
-        if use_wind:
-            u = np.array(wind, dtype=float)
-            u /= max(np.linalg.norm(u), 1e-9)       # measured upwind direction → source
-            shift_confident = True
-            method = 'wind'
-        elif sign_skew != 0 and sign_skew == sign_ext and elongated and strong_signal:
-            u = e_major * sign_skew                 # unit vector → source (inferred)
-            shift_confident = True
-            method = 'wind-free'
-        else:
-            u = e_major                             # orientation only, no sign
-            shift_confident = False
-            method = 'wind-free'
-
-        # ── Anisotropic, axis-aligned KDE bandwidths ──
-        ell_major = max(0.6 * sigma_major, 4 * grid_res)
-        ell_minor = max(0.6 * sigma_minor, 3 * grid_res)
-
-        # Subsample for tractable broadcasting on large datasets
-        N = len(xp)
-        if N > 1500:
-            sel = np.random.default_rng(0).choice(N, 1500, replace=False)
-        else:
-            sel = np.arange(N)
-
-        gxf = gx.ravel().astype(np.float32)
-        gyf = gy.ravel().astype(np.float32)
-        u0 = np.float32(u[0]); u1 = np.float32(u[1])
-        em = np.float32(ell_major); en = np.float32(ell_minor)
-
-        def aniso_density(idx):
-            """Vectorized anisotropic Gaussian KDE over the grid (ppm²-weighted)."""
-            sx = xp[idx].astype(np.float32); sy = yp[idx].astype(np.float32)
-            sw = w[idx].astype(np.float32)
-            sw = sw / max(float(sw.sum()), 1e-12)
-            ddx = gxf[:, None] - sx[None, :]
-            ddy = gyf[:, None] - sy[None, :]
-            a = ddx * u0 + ddy * u1                 # along-axis offset
-            b = -ddx * u1 + ddy * u0                # cross-axis offset
-            kern = np.exp(-0.5 * ((a / em) ** 2 + (b / en) ** 2))
-            return (kern * sw[None, :]).sum(axis=1)
-
-        if tp is not None and N >= 60:
-            # Geometric mean across time bins → reward persistent hotspots
-            order = np.argsort(tp)
-            bins = np.array_split(order, 3)
-            log_acc = np.zeros(gxf.shape, dtype=np.float64)
-            used = 0
-            for b_idx in bins:
-                b_sel = np.intersect1d(b_idx, sel) if N > 1500 else b_idx
-                if len(b_sel) < 5:
-                    b_sel = b_idx
-                d = aniso_density(b_sel).astype(np.float64)
-                d /= max(d.sum(), 1e-12)
-                log_acc += np.log(d + 1e-9)
-                used += 1
-            dens = np.exp(log_acc / max(used, 1))
-        else:
-            dens = aniso_density(sel).astype(np.float64)
-
-        posterior = np.clip(dens.reshape(gx.shape), 0, None)
-        psum = posterior.sum()
-        posterior = (posterior / psum) if psum > 0 else np.ones_like(posterior) / posterior.size
-
-        pr, pc = np.unravel_index(np.argmax(posterior), posterior.shape)
-        best_x, best_y = float(gx[pr, pc]), float(gy[pr, pc])
-
-        # Shift the ppm²-weighted centroid upwind toward the source. The
-        # MEASURED wind gives a reliable direction, so we shift a full ~1σ
-        # (the upwind extent of the plume bulk). The wind-free inferred
-        # direction is less trustworthy, so it shifts more conservatively, and
-        # only when confident. A bounded shift is used rather than the upwind
-        # *edge* (percentile), which overshoots badly when gas diffuses against
-        # the mean wind.
-        if use_wind:
-            shift = 1.0 * sigma_major
-        else:
-            shift = 0.6 * sigma_major if shift_confident else 0.0
-        src_x = float(mu_x + shift * u[0])
-        src_y = float(mu_y + shift * u[1])
-
-        return {
-            'posterior': posterior, 'gx': gx, 'gy': gy,
-            'best_x': best_x, 'best_y': best_y,
-            'src_x': src_x, 'src_y': src_y,
-            'conf_radius': float(np.sqrt(max(sigma_major * sigma_minor, 1e-4))),
-            'axis': (float(u[0]), float(u[1])),
-            'directional': bool(shift_confident), 'method': method,
-            'low_confidence': bool(low_confidence), 'peak_ppm': peak_ppm,
-            'sigma_major': sigma_major, 'sigma_minor': sigma_minor,
-            'candidates': self._top_candidates(posterior, gx, gy, n=3),
-            'grid_res': grid_res,
-        }
+        return gas_viz.estimate_source(
+            xs, ys, ppm, timestamps=timestamps, grid_res=grid_res, wind=wind,
+            wind_consistency=wind_consistency, use_wind_shift=use_wind_shift,
+            baseline_sigma=baseline_sigma)
 
     def _compute_localization_metrics(self):
         """Build benchmark metrics: localization error vs. ground truth,
@@ -2026,7 +1850,10 @@ class AutoCoverageMapper(Node):
         from scipy.ndimage import gaussian_filter
         from matplotlib.colors import LogNorm, PowerNorm
         from matplotlib.patches import Ellipse
-        from matplotlib_scalebar.scalebar import ScaleBar
+        try:
+            from matplotlib_scalebar.scalebar import ScaleBar
+        except Exception:
+            ScaleBar = None
 
         CMAP = 'viridis'
 
@@ -2142,7 +1969,9 @@ class AutoCoverageMapper(Node):
                               interpolation='nearest', zorder=5)
 
             def _scalebar(ax):
-                """Add a 1m scale bar."""
+                """Add a 1m scale bar (no-op if matplotlib-scalebar missing)."""
+                if ScaleBar is None:
+                    return
                 ax.add_artist(ScaleBar(1.0, 'm', location='lower left',
                                        length_fraction=0.15, box_alpha=0.7,
                                        font_properties={'size': 10}))
@@ -2369,121 +2198,36 @@ class AutoCoverageMapper(Node):
             fig.savefig(os.path.join(out, f'{clean}_dashboard.png'), dpi=250)
             plt.close(fig)
 
-            # ── 10) Source Localization (probability distribution) ──
-            print(f"Running source localization for {t}...")
-            # Reuse the result computed in _save_data when available (keeps the
-            # saved NPZ and the figure perfectly consistent).
+            # ── 10) Probabilistic source region + concentration intensity ──
+            #   Delegated to gas_viz so live and offline figures are identical.
             r = self._loc_results.get(clean)
             if r is None:
-                r = self._estimate_source(xs, ys, ppm, timestamps=np.array(d['timestamp']))
-            posterior, gx, gy = r['posterior'], r['gx'], r['gy']
-            src_x, src_y = r['src_x'], r['src_y']
-            sig_maj, sig_min = r['sigma_major'], r['sigma_minor']
-            ux, uy = r['axis']
-
-            fig, ax = plt.subplots(figsize=(10, 8))
-            post_max = max(np.max(posterior), 1e-10)
-            post_smooth = gaussian_filter(posterior, sigma=2.0)
-            norm_post = PowerNorm(gamma=0.4, vmin=0, vmax=post_max)
-            rgba_post = cmap_obj(norm_post(post_smooth))
-            src_extent = [gx[0, 0], gx[0, -1], gy[0, 0], gy[-1, 0]]
-            ax.imshow(rgba_post, extent=src_extent, origin='lower',
-                      interpolation='bilinear', zorder=1, aspect='auto')
-            _walls(ax)
-            plt.colorbar(plt.cm.ScalarMappable(cmap=CMAP, norm=norm_post),
-                         ax=ax, label='P(source)', shrink=0.82)
-
-            # ── Credible "search region": smallest area holding 50% of the
-            # posterior mass. This is the primary deliverable — "look here".
-            flat = posterior.ravel()
-            order = np.argsort(flat)[::-1]
-            csum = np.cumsum(flat[order])
-            csum /= csum[-1]
-            k50 = np.searchsorted(csum, 0.50)
-            thr50 = flat[order[min(k50, len(order) - 1)]]
-            try:
-                cs = ax.contour(gx, gy, posterior, levels=[thr50],
-                                colors=['#ff3b3b'], linewidths=2.0, zorder=6)
-                ax.plot([], [], color='#ff3b3b', lw=2.0,
-                        label='50% search region')
-            except Exception:
-                pass
-
-            # Anisotropic confidence ellipse aligned to the recovered plume axis
-            ang = math.degrees(math.atan2(uy, ux))
-            ellipse = Ellipse((src_x, src_y), width=2 * sig_maj, height=2 * sig_min,
-                              angle=ang, fill=False, edgecolor='white',
-                              linestyle='--', linewidth=1.5, alpha=0.85, zorder=6)
-            ax.add_patch(ellipse)
-
-            # Recovered plume axis. If the source direction is confident, draw a
-            # one-way arrow toward the source (upwind); otherwise just show the
-            # undirected axis line (we know the orientation, not which end).
-            alen = max(sig_maj, 0.5)
-            if r.get('directional'):
-                ax.annotate('', xy=(src_x + ux * alen, src_y + uy * alen),
-                            xytext=(src_x - ux * alen, src_y - uy * alen),
-                            arrowprops=dict(arrowstyle='-|>', color='#00e5ff',
-                                            lw=2.0, alpha=0.9), zorder=6)
-                ax.text(src_x - ux * alen, src_y - uy * alen, ' downwind',
-                        color='#00e5ff', fontsize=8, alpha=0.9, zorder=7)
-            else:
-                ax.plot([src_x - ux * alen, src_x + ux * alen],
-                        [src_y - uy * alen, src_y + uy * alen],
-                        color='#00e5ff', lw=1.8, alpha=0.8, zorder=6,
-                        label='Plume axis (direction unknown)')
-
-            # Best-guess centre of the region + ranked candidate spots
-            ax.plot(src_x, src_y, 'r*', markersize=18, markeredgecolor='white',
-                    markeredgewidth=1.0, zorder=7,
-                    label=f'Best guess: ({src_x:.2f}, {src_y:.2f})')
-            for rank, (cxv, cyv, _) in enumerate(r['candidates'][:3], 1):
-                ax.plot(cxv, cyv, 'o', markersize=9, markerfacecolor='none',
-                        markeredgecolor='yellow', markeredgewidth=1.5, zorder=6)
-                ax.text(cxv, cyv, f' #{rank}', color='yellow', fontsize=9,
-                        fontweight='bold', zorder=7)
-
-            max_ppm_idx = np.argmax(ppm)
-            ax.plot(xs[max_ppm_idx], ys[max_ppm_idx], 'w^', markersize=10,
-                    markeredgecolor='black', markeredgewidth=0.5,
-                    label='Max reading', zorder=6)
-
-            # Ground-truth source(s) + error annotation (benchmark overlay)
+                r = self._estimate_source(xs, ys, ppm,
+                                          timestamps=np.array(d['timestamp']))
             if self._true_sources is None:
                 self._true_sources = self._parse_true_sources()
-            err_txt = ''
-            for s in self._true_sources:
-                ax.plot(s['x'], s['y'], 'P', markersize=13, color='#ff1493',
-                        markeredgecolor='white', markeredgewidth=0.8, zorder=8)
             entry = self._metrics.get('per_gas', {}).get(clean, {})
-            if 'error_m' in entry:
-                tx, ty = entry['true_x'], entry['true_y']
-                ax.plot([src_x, tx], [src_y, ty], color='#ff1493',
-                        linestyle=':', linewidth=1.3, alpha=0.9, zorder=7)
-                err_txt = f"  |  error = {entry['error_m']:.2f} m"
-                ax.plot([], [], 'P', color='#ff1493',
-                        label=f'True source ({tx:.2f}, {ty:.2f})')
-
-            _scalebar(ax)
-            ax.set_xlabel('X (m)'); ax.set_ylabel('Y (m)')
-            meth = r.get('method', 'wind-free')
-            title = f'Source Region ({meth}) \u2014 P(source) + 50% search region' + err_txt
-            if r.get('low_confidence'):
-                title += f"\n[!] LOW CONFIDENCE \u2014 peak only {r.get('peak_ppm', 0):.2f} ppm (gas barely detected)"
-            ax.set_title(title)
-            ax.legend(loc='upper right', fontsize=8)
-            ax.set_aspect('equal')
-            fig.tight_layout()
-            fig.savefig(os.path.join(out, f'{clean}_source_localization.png'), dpi=250)
-            plt.close(fig)
-
+            matched = ([{'name': entry.get('true_name', 'source'),
+                         'x': entry['true_x'], 'y': entry['true_y']}]
+                       if 'true_x' in entry else None)
+            _cu = self._cusums.get(t)
+            _bmu = _cu.baseline_mu if (_cu is not None and _cu.is_calibrated()) else 0.0
+            _bsig = _cu.baseline_sigma if (_cu is not None and _cu.is_calibrated()) else None
+            walls = (occ_rgba, occ_extent)
+            gas_viz.concentration_intensity_map(
+                os.path.join(out, f'{clean}_concentration_intensity.png'),
+                clean, xs, ys, ppm, baseline_mu=_bmu, baseline_sigma=_bsig,
+                walls=walls, true_sources=matched)
+            gas_viz.source_posterior_map(
+                os.path.join(out, f'{clean}_source_localization.png'),
+                clean, xs, ys, ppm, r, walls=walls,
+                true_sources=matched, entry=entry)
             print(
-                f"  Source estimate: ({src_x:.2f}, {src_y:.2f}), "
-                f"plume axis=({ux:.2f}, {uy:.2f}), \u03c3=({sig_maj:.2f}, {sig_min:.2f})m"
-                + (f", error={entry['error_m']:.2f}m" if 'error_m' in entry else '')
-            )
+                f"  Source region: ({r['src_x']:.2f}, {r['src_y']:.2f}) "
+                f"method={r.get('method')}, HPD50={r.get('hpd50', 0):.2f} m2"
+                + (f", error={entry['error_m']:.2f}m" if 'error_m' in entry else ''))
 
-            print(f"Saved 10 plots for {t} -> {out}")
+            print(f"Saved plots for {t} -> {out}")
 
         # \u2500\u2500 Cross-gas localization benchmark (predicted vs. actual) \u2500\u2500
         try:

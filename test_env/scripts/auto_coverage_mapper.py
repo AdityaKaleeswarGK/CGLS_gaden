@@ -38,6 +38,10 @@ from rclpy.executors import MultiThreadedExecutor
 
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
+try:
+    from nav2_msgs.msg import SpeedLimit
+except ImportError:
+    SpeedLimit = None
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
 from olfaction_msgs.msg import GasSensor
@@ -182,7 +186,12 @@ class AutoCoverageMapper(Node):
         # which is what makes localization accurate.
         self.declare_parameter('reactive_refine', True)
         # Slowdown
-        self.declare_parameter('gas_slowdown_speed', 0.15)
+        self.declare_parameter('gas_slowdown_speed', 0.15)  # deprecated (old direct-cmd_vel override)
+        # Reactive slowdown near gas, issued as a Nav2 speed limit so the
+        # controller keeps full steering + obstacle avoidance. Set enabled=False
+        # to A/B test against no slowdown.
+        self.declare_parameter('reactive_slowdown_enabled', True)
+        self.declare_parameter('gas_slowdown_pct', 30.0)  # % of max speed while a CUSUM is spiking
         # Output control
         self.declare_parameter('generate_plots', False)
         # Scenario config path (for README generation)
@@ -197,6 +206,8 @@ class AutoCoverageMapper(Node):
         self.nav_timeout = self.get_parameter('nav_timeout').value
         self.wp_tolerance = self.get_parameter('wp_tolerance').value
         self.gas_slowdown_speed = self.get_parameter('gas_slowdown_speed').value
+        self.reactive_slowdown_enabled = self.get_parameter('reactive_slowdown_enabled').value
+        self.gas_slowdown_pct = self.get_parameter('gas_slowdown_pct').value
         self.generate_plots = self.get_parameter('generate_plots').value
         self.scenario_path = self.get_parameter('scenario_path').value
         self.min_spike_samples = self.get_parameter('min_spike_samples').value
@@ -236,6 +247,12 @@ class AutoCoverageMapper(Node):
         self.cbg = ReentrantCallbackGroup()
         self.nav_client = ActionClient(self, NavigateToPose, f'/{self.ns}/navigate_to_pose', callback_group=self.cbg)
         self.cmd_vel_pub = self.create_publisher(Twist, f'/{self.ns}/cmd_vel', 10)
+        # Speed-limit channel: Nav2 controller_server subscribes to <ns>/speed_limit
+        # and scales its OWN output, so we slow near gas without ever touching
+        # cmd_vel directly — Nav2 retains full collision avoidance.
+        self.speed_limit_pub = (self.create_publisher(SpeedLimit, f'/{self.ns}/speed_limit', 10)
+                                if SpeedLimit is not None else None)
+        self._speed_limited = False    # True when a reduced speed limit is currently set
 
         self.all_waypoints = []        # coarse path (for plotting)
         self.refinement_waypoints = [] # fine path (for plotting)
@@ -878,6 +895,9 @@ class AutoCoverageMapper(Node):
         max_consecutive_failures = 2
         consecutive_failures = 0
         last_good_x, last_good_y = self.robot_x, self.robot_y
+        # Start the phase unrestricted; reactive slowdown re-applies as gas appears.
+        self._speed_limited = False
+        self._set_speed_limit(100.0)
 
         for idx, (wx, wy) in enumerate(waypoints):
             if not rclpy.ok() or not self._running:
@@ -1178,6 +1198,22 @@ class AutoCoverageMapper(Node):
         except Exception:
             pass
 
+    def _set_speed_limit(self, pct: float):
+        """Ask Nav2 to cap speed at ``pct`` % of max (100 = unrestricted).
+
+        Consumed by controller_server's built-in ``speed_limit`` subscription, so
+        Nav2 scales its own velocity and keeps doing collision avoidance — we
+        never publish cmd_vel here. No-op if nav2_msgs/SpeedLimit is unavailable
+        (the robot then simply runs at full speed near gas, which is still safe).
+        """
+        if self.speed_limit_pub is None:
+            return
+        msg = SpeedLimit()
+        msg.header.frame_id = 'map'
+        msg.percentage = True
+        msg.speed_limit = float(pct)
+        self.speed_limit_pub.publish(msg)
+
     def _navigate_to(self, x: float, y: float) -> bool:
         self._update_robot_pose()
         dist = math.hypot(self.robot_x - x, self.robot_y - y)
@@ -1244,13 +1280,18 @@ class AutoCoverageMapper(Node):
                 result_event.wait(timeout=2.0)
                 break
 
-            # Reactive slowdown when any sensor's CUSUM is spiking
-            if self._any_cusum_spiking:
-                twist = Twist()
-                twist.linear.x = self.gas_slowdown_speed
-                yaw_to_goal = math.atan2(y - self.robot_y, x - self.robot_x)
-                twist.angular.z = yaw_to_goal * 0.5
-                self.cmd_vel_pub.publish(twist)
+            # Reactive slowdown near gas — issued as a Nav2 speed limit (not a
+            # direct cmd_vel command). The controller server caps its own speed
+            # while keeping full steering + obstacle avoidance, so we no longer
+            # fight Nav2 and bump in tight, gas-filled passages. Published only on
+            # state transitions to avoid topic spam.
+            if self.reactive_slowdown_enabled:
+                if self._any_cusum_spiking and not self._speed_limited:
+                    self._set_speed_limit(self.gas_slowdown_pct)
+                    self._speed_limited = True
+                elif not self._any_cusum_spiking and self._speed_limited:
+                    self._set_speed_limit(100.0)
+                    self._speed_limited = False
 
         self._update_robot_pose()
         dist = math.hypot(self.robot_x - x, self.robot_y - y)

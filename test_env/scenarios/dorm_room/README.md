@@ -74,6 +74,7 @@ ros2 run test_env auto_coverage_mapper --ros-args \
   -p sensor_topics:=['/gas1/Sensor_reading'] \
   -p use_wind_shift:=true \
   -p nogo_skip_enabled:=true -p nogo_radius:=0.6 -p nogo_label:=fire \
+  -p cusum_h:=3.0 -p cusum_noise_floor:=0.05 \
   -p gas_labels:=['/gas1/Sensor_reading=carbonDioxide']
 ```
 
@@ -84,6 +85,25 @@ source read from `sim.yaml`), so you don't hardcode coordinates. The robot route
 **around** that region and it is drawn on the concentration/hazard maps as a
 **Detected High-Risk Zone** — a red danger glow with a dashed keep-out boundary
 and a centre diamond. (To override, still pass `nogo_x`/`nogo_y` explicitly.)
+
+## If it drives through the fire, or never detects CO₂
+
+- **Robot enters the fire region.** First confirm the keep-out is *active and
+  centred*: at startup the mapper logs `No-go auto-centred on gas source
+  (3.80, 1.80) from sim.yaml`, and the output plots draw the **Detected
+  High-Risk Zone** at the fire. If that log line is missing you're running a
+  stale build — rebuild (or pass `-p nogo_x:=3.8 -p nogo_y:=1.8`). Note the
+  keep-out only removes *waypoints*; Nav2 can still plan a *transit path* across
+  it, so if it clips the zone you need a true **Nav2 keepout** (costmap
+  obstacle) rather than the waypoint skip.
+- **CUSUM never fires.** It only trips when `/gas1/Sensor_reading` rises ~0.5 ppm
+  over baseline, so first check the reading is non-zero:
+  `ros2 topic echo /gas1/Sensor_reading --field raw`. If it is flat 0 the cause
+  is upstream — make sure step 3 was launched with `gas1_target:=carbonDioxide`
+  and that step 2 (gas sim) was re-run. If it is small but non-zero, lower the
+  trigger (already in the step-4 command): `cusum_h:=3.0` and
+  `cusum_noise_floor:=0.05` (lower = more sensitive; the σ floor only helps once
+  the baseline noise itself is below it).
 
 ## Tuning
 

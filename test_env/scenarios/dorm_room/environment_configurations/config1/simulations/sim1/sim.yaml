@@ -1,17 +1,17 @@
 source:
   sourceType: point
-  position: [3.8, 2.2, 0.5]
+  position: [3.8, 1.8, 0.5]  # fire toward the bottom of the (now longer) room
   gasType: 11  # carbonDioxide (fire combustion product; specific gravity 1.52 -> sinks)
 deltaTime: 0.1
 windIterationDeltaTime: 1
 temperature: 298
 pressure: 1
-filamentPPMcenter: 20
+filamentPPMcenter: 10   # subtle, controlled CO2 release (was 20 -> too much)
 filamentInitialSigma: 10
-filamentGrowthGamma: 10
-filamentNoise_std: 0.02
-numFilaments_sec: 10
-expectedNumIterations: 600
+filamentGrowthGamma: 20  # filaments grow faster -> plume spreads through the room
+filamentNoise_std: 0.04  # more turbulent dispersion to other parts
+numFilaments_sec: 5      # controlled emission rate (was 10)
+expectedNumIterations: 900  # longer room: give the plume time to vent + spread
 saveResults: true
 saveDeltaTime: 0.5
 preCalculateConcentrations: false

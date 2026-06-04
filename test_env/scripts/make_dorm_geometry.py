@@ -11,10 +11,12 @@ Re-run this script after editing the dimensions below to regenerate the CAD:
 
 Layout (metres, origin at the lower-left corner, matching the floor-plan sketch):
 
-    +Y (5.0) +----[ wardrobe ]---=== window ===----------------+
+    +Y (7.0) +-[ wardrobe ]-=== window ===---------------------+
              |                                                 |
-             |                   * fire / CO2  (3.80, 2.20)    |
-             |                                                 |
+             |                                                 |  CO2 vents up
+             |                                                 |  to the window
+             |                                                 |  and spreads
+             |                   * fire / CO2  (3.80, 1.80)    |  through the room
              |                 ^ start (2.70, 0.60)            |
        (0,0) +-------------------------------------------------+ +X (5.4)
 """
@@ -24,7 +26,7 @@ import struct
 # --- Geometry (metres) -------------------------------------------------
 T = 0.20            # wall thickness (>= 2 cells @ 0.1 m -> watertight barrier)
 H = 2.40            # room height
-X1, Y1 = 5.40, 5.00  # outer extents
+X1, Y1 = 5.40, 7.00  # outer extents (Y1 = bottom->top length)
 
 # "Open window" opening on the TOP wall (top-left region of the room)
 WIN_X0, WIN_X1 = 1.90, 2.90
@@ -36,7 +38,7 @@ WALLS = [
     (WIN_X1, X1,     Y1 - T, Y1,   0.0, H),   # top wall  (right of window)
     (0.0,    T,      0.0,    Y1,   0.0, H),   # left wall
     (X1 - T, X1,     0.0,    Y1,   0.0, H),   # right wall
-    (T,      1.60,   3.60,   Y1 - T, 0.0, H), # wardrobe (top-left obstacle)
+    (T,      1.60,   Y1 - T - 1.20, Y1 - T, 0.0, H), # wardrobe (top-left obstacle, pinned to top wall)
 ]
 
 # Window outlet plate -- seals the top-wall gap as a GADEN outlet (open vent)

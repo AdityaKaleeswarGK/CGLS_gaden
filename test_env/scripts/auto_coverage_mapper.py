@@ -237,6 +237,17 @@ class AutoCoverageMapper(Node):
         self.yolo_confidence = self.get_parameter('yolo_confidence').value
         self._nogo_detected = False
         self._nogo_event = None
+        # If the no-go is enabled but no centre was given, treat the gas SOURCE
+        # as the hazard (e.g. fire) and auto-centre the keep-out on it, read
+        # from the scenario's sim.yaml. Gated on nogo_skip_enabled, so other
+        # scenarios are unaffected.
+        if self.nogo_skip_enabled and self.nogo_x == 0.0 and self.nogo_y == 0.0:
+            _srcs = self._parse_true_sources()
+            if _srcs:
+                self.nogo_x, self.nogo_y = _srcs[0]['x'], _srcs[0]['y']
+                self.get_logger().info(
+                    f"No-go auto-centred on gas source "
+                    f"({self.nogo_x:.2f}, {self.nogo_y:.2f}) from sim.yaml")
         self.min_spike_samples = self.get_parameter('min_spike_samples').value
         self.min_spike_peak_sigma = self.get_parameter('min_spike_peak_sigma').value
         self.max_hotspots = self.get_parameter('max_hotspots').value
@@ -2164,16 +2175,27 @@ class AutoCoverageMapper(Node):
                         family='monospace', zorder=6)
 
             def _nogo(ax):
-                """Overlay the YOLO no-go zone (hazard the robot avoided)."""
+                """Mark the detected high-risk zone (hazard/fire the robot
+                routed around) on the hazard map: a red radial 'danger glow', a
+                dashed keep-out boundary, a centre diamond and a label."""
                 if not self.nogo_skip_enabled:
                     return
                 from matplotlib.patches import Circle
-                ax.add_patch(Circle((self.nogo_x, self.nogo_y), self.nogo_radius,
-                                    facecolor='red', alpha=0.18, edgecolor='red',
-                                    linewidth=1.8, hatch='xx', zorder=5.5))
-                ax.plot(self.nogo_x, self.nogo_y, marker='x', color='red',
-                        markersize=13, markeredgewidth=2.5, zorder=6.5,
-                        label=f'YOLO {self.nogo_label} (no-go)')
+                cx, cy, r = self.nogo_x, self.nogo_y, self.nogo_radius
+                # concentric fading rings -> radial high-risk "glow"
+                for frac, a in ((1.0, 0.10), (0.70, 0.15), (0.42, 0.22), (0.20, 0.32)):
+                    ax.add_patch(Circle((cx, cy), r * frac, facecolor='red',
+                                        edgecolor='none', alpha=a, zorder=5.3))
+                # keep-out boundary
+                ax.add_patch(Circle((cx, cy), r, facecolor='none', edgecolor='red',
+                                    linewidth=2.0, linestyle='--', zorder=5.6))
+                # centre marker (diamond) + label, echoing the hazard-map style
+                ax.plot(cx, cy, marker='D', color='red', markersize=10,
+                        markeredgecolor='white', markeredgewidth=1.2, zorder=6.6,
+                        label=f'Detected high-risk zone ({self.nogo_label})')
+                ax.annotate('Detected\nHigh-Risk Zone', xy=(cx, cy),
+                            xytext=(cx + r + 0.15, cy), fontsize=9, color='red',
+                            fontweight='bold', va='center', zorder=6.7)
 
             # ── 1) Coverage path ──
             fig, ax = plt.subplots(figsize=(10, 8))

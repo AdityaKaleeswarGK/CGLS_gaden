@@ -73,13 +73,17 @@ ros2 run test_env auto_coverage_mapper --ros-args \
   -p generate_plots:=true \
   -p sensor_topics:=['/gas1/Sensor_reading'] \
   -p use_wind_shift:=true \
-  -p nogo_skip_enabled:=true -p nogo_x:=3.8 -p nogo_y:=1.8 -p nogo_radius:=0.6 -p nogo_label:=fire \
+  -p nogo_skip_enabled:=true -p nogo_radius:=0.6 -p nogo_label:=fire \
   -p gas_labels:=['/gas1/Sensor_reading=carbonDioxide']
 ```
 
 Results land in `~/gaden_results/auto_coverage/<timestamp>/` (plots, `readings.csv`,
-`yolo_events.csv`, `run_data.npz`, `README.md`). The coverage/heatmap plots show
-the fire no-go as a red hatched circle.
+`yolo_events.csv`, `run_data.npz`, `README.md`). With `nogo_skip_enabled:=true`
+and no `nogo_x/nogo_y` given, the keep-out **auto-centres on the fire** (the gas
+source read from `sim.yaml`), so you don't hardcode coordinates. The robot routes
+**around** that region and it is drawn on the concentration/hazard maps as a
+**Detected High-Risk Zone** — a red danger glow with a dashed keep-out boundary
+and a centre diamond. (To override, still pass `nogo_x`/`nogo_y` explicitly.)
 
 ## Tuning
 

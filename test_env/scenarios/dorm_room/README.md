@@ -39,7 +39,7 @@ forming one tight jet. (Smoke — gasType 13 — would instead *rise*; see Tunin
 | Robot start        | (2.70, 0.60), facing +Y                           |
 | Fire / CO₂ source  | point (3.80, 1.80, 0.50), `gasType: 11` (CO₂)     |
 | YOLO no-go         | centre (3.80, 1.80), radius 0.6 m (carved 0.9 m)  |
-| Wind               | feeble dorm draft (-0.02, 0.07, 0) m/s ≈ 0.07     |
+| Wind               | feeble dorm draft (-0.02, 0.06, 0) m/s ≈ 0.06     |
 
 CO₂ has specific gravity **1.52** (heavier than air → sinks and pools low), so
 the low gas sensor (z = 0.5 m) detects it well. The feeble but steady dorm
@@ -91,8 +91,8 @@ the fire no-go as a red hatched circle.
   source is detected easily — raise z to model a higher fire.
 - **CO₂ amount & spread** — also in `sim1/sim.yaml`: `filamentPPMcenter` (10) and
   `numFilaments_sec` (5) set *how much* CO₂ (lower = subtler); `filamentGrowthGamma`
-  (20) and `filamentNoise_std` (0.04) set *how widely* it spreads (higher = reaches
-  more of the room, lower peaks). To model **smoke** that rises instead, set
+  (20) and `filamentNoise_std` (0.07) set *how widely* it spreads (higher = reaches
+  more of the room — including slowly backward/below the source — at lower peaks). To model **smoke** that rises instead, set
   `gasType: 13` (specific gravity 0.89) and raise the sensor height.
   **Any of these changes requires re-running step 2** (the dispersal is precomputed).
 - **Window / draft** — move the window gap in `make_dorm_geometry.py` and the

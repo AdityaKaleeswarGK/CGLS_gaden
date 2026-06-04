@@ -196,6 +196,24 @@ class AutoCoverageMapper(Node):
         self.declare_parameter('generate_plots', False)
         # Scenario config path (for README generation)
         self.declare_parameter('scenario_path', '')
+        # ── Pseudo-YOLO no-go zone (a hazard the robot must avoid, e.g. a fire) ──
+        # GADEN cannot simulate the hazard object itself, so it is modelled as a
+        # known ground-truth location. The zone is carved out of the coverage
+        # sweep (the lawnmower routes around it), and the first time the robot
+        # comes within yolo_detect_range a single high-confidence "detection" is
+        # logged (pseudo-YOLO). All OFF by default → other scenarios unaffected.
+        self.declare_parameter('nogo_skip_enabled', False)
+        self.declare_parameter('nogo_x', 0.0)
+        self.declare_parameter('nogo_y', 0.0)
+        self.declare_parameter('nogo_radius', 0.6)        # keep-out radius (m)
+        self.declare_parameter('nogo_label', 'hazard')    # label for logs/plots/README
+        self.declare_parameter('yolo_detect_range', 1.5)  # proximity that triggers detection (m)
+        self.declare_parameter('yolo_confidence', 0.92)   # pseudo detection confidence
+        # Optional per-topic gas-name overrides, e.g.
+        #   gas_labels:=['/gas1/Sensor_reading=carbonDioxide']
+        # (default [''] — a non-empty list so rclpy infers STRING_ARRAY; the
+        #  empty entry is ignored by the '=' check below)
+        self.declare_parameter('gas_labels', [''])
 
         self.ns = self.get_parameter('namespace').value
         self.topics = self.get_parameter('sensor_topics').value
@@ -210,6 +228,15 @@ class AutoCoverageMapper(Node):
         self.gas_slowdown_pct = self.get_parameter('gas_slowdown_pct').value
         self.generate_plots = self.get_parameter('generate_plots').value
         self.scenario_path = self.get_parameter('scenario_path').value
+        self.nogo_skip_enabled = self.get_parameter('nogo_skip_enabled').value
+        self.nogo_x = self.get_parameter('nogo_x').value
+        self.nogo_y = self.get_parameter('nogo_y').value
+        self.nogo_radius = self.get_parameter('nogo_radius').value
+        self.nogo_label = self.get_parameter('nogo_label').value
+        self.yolo_detect_range = self.get_parameter('yolo_detect_range').value
+        self.yolo_confidence = self.get_parameter('yolo_confidence').value
+        self._nogo_detected = False
+        self._nogo_event = None
         self.min_spike_samples = self.get_parameter('min_spike_samples').value
         self.min_spike_peak_sigma = self.get_parameter('min_spike_peak_sigma').value
         self.max_hotspots = self.get_parameter('max_hotspots').value
@@ -226,6 +253,11 @@ class AutoCoverageMapper(Node):
             '/gas3/Sensor_reading': 'hydrogen',
             '/gas4/Sensor_reading': 'propanol',
         }
+        # Optional per-topic gas-name overrides (e.g. gas1 retargeted to CO2)
+        for entry in (self.get_parameter('gas_labels').value or []):
+            if '=' in entry:
+                topic, label = entry.split('=', 1)
+                self._sensor_type_map[topic.strip()] = label.strip()
 
         # CUSUM detector — one per sensor topic (independent calibration & thresholds)
         cusum_warmup = self.get_parameter('cusum_warmup').value
@@ -641,6 +673,55 @@ class AutoCoverageMapper(Node):
         self._conc_pub.publish(msg)
 
     # ────────────────────────────────────────────────────────────
+    #  Pseudo-YOLO no-go zone (a hazard the robot must avoid, e.g. fire)
+    # ────────────────────────────────────────────────────────────
+    def _in_nogo_zone(self, x, y):
+        """True if (x, y) falls inside the keep-out circle (inflated by the
+        robot footprint), so the coverage planner routes around the hazard."""
+        if not self.nogo_skip_enabled:
+            return False
+        r = self.nogo_radius + self.safe_distance
+        return math.hypot(x - self.nogo_x, y - self.nogo_y) <= r
+
+    def _check_yolo_nogo(self):
+        """Pseudo-YOLO: the first time the robot comes within yolo_detect_range
+        of the hazard, log one high-confidence detection. The no-go zone is
+        already carved out of the sweep — this records the 'trigger' moment for
+        the README/plots and appends to yolo_events.csv."""
+        if not self.nogo_skip_enabled or self._nogo_detected:
+            return
+        self._update_robot_pose()
+        d = math.hypot(self.robot_x - self.nogo_x, self.robot_y - self.nogo_y)
+        if d > self.yolo_detect_range:
+            return
+        self._nogo_detected = True
+        stamp = self.get_clock().now().nanoseconds / 1e9
+        self._nogo_event = {
+            'time': stamp, 'conf': self.yolo_confidence, 'label': self.nogo_label,
+            'hazard_x': self.nogo_x, 'hazard_y': self.nogo_y,
+            'robot_x': self.robot_x, 'robot_y': self.robot_y, 'range_m': d,
+        }
+        self.get_logger().warning(
+            f"🟥 YOLO {self.nogo_label.upper()} DETECTED "
+            f"(conf={self.yolo_confidence:.2f}) at ({self.nogo_x:.2f}, {self.nogo_y:.2f}) "
+            f"— robot {d:.2f} m away. Keep-out r={self.nogo_radius:.2f} m; "
+            f"skipping it and covering the rest."
+        )
+        try:
+            ev = os.path.join(self._run_dir, 'yolo_events.csv')
+            new = not os.path.exists(ev)
+            with open(ev, 'a', newline='') as f:
+                wr = csv.writer(f)
+                if new:
+                    wr.writerow(['time', 'label', 'hazard_x', 'hazard_y', 'confidence',
+                                 'robot_x', 'robot_y', 'detect_range_m', 'nogo_radius_m'])
+                wr.writerow([f'{stamp:.3f}', self.nogo_label, self.nogo_x, self.nogo_y,
+                             self.yolo_confidence, f'{self.robot_x:.3f}',
+                             f'{self.robot_y:.3f}', f'{d:.3f}', self.nogo_radius])
+        except Exception:
+            pass
+
+    # ────────────────────────────────────────────────────────────
     #  BCD Path Generation (parameterized by step size + optional bbox)
     # ────────────────────────────────────────────────────────────
     def _generate_bcd_waypoints(self, step, bbox=None):
@@ -683,6 +764,10 @@ class AutoCoverageMapper(Node):
                     cmin, cmax = max(0, c - s_cells), min(w - 1, c + s_cells)
                     chunk = data[rmin:rmax + 1, cmin:cmax + 1]
                     free = chunk.size > 0 and np.all((chunk >= 0) & (chunk < 40))
+
+                    # Pseudo-YOLO no-go zone: treat as not-free so laps split around it
+                    if free and self._in_nogo_zone(cx, cy):
+                        free = False
 
                     if free:
                         if c_start is None:
@@ -902,6 +987,13 @@ class AutoCoverageMapper(Node):
         for idx, (wx, wy) in enumerate(waypoints):
             if not rclpy.ok() or not self._running:
                 break
+
+            # Pseudo-YOLO: fire the detection event once the robot is near the
+            # hazard, and never drive a waypoint that lies inside the no-go zone.
+            self._check_yolo_nogo()
+            if self.nogo_skip_enabled and self._in_nogo_zone(wx, wy):
+                skipped += 1
+                continue
 
             if not self._is_waypoint_reachable(wx, wy):
                 skipped += 1
@@ -1320,6 +1412,15 @@ class AutoCoverageMapper(Node):
 
         # Free cells: occupancy value 0 (definitely free)
         free_mask = (self.map_data >= 0) & (self.map_data < 40)
+        # The robot is meant to skip the YOLO no-go zone, so don't count those
+        # cells against coverage — exclude them from the free-cell denominator.
+        if self.nogo_skip_enabled:
+            ys_idx, xs_idx = np.nonzero(free_mask)
+            wxs = ox + (xs_idx + 0.5) * res
+            wys = oy + (ys_idx + 0.5) * res
+            inside = np.hypot(wxs - self.nogo_x, wys - self.nogo_y) <= \
+                (self.nogo_radius + self.safe_distance)
+            free_mask[ys_idx[inside], xs_idx[inside]] = False
         total_free = int(np.sum(free_mask))
         if total_free == 0:
             return 0.0
@@ -1453,6 +1554,30 @@ class AutoCoverageMapper(Node):
             lines.append(f'- **Map coverage:** {self._coverage_pct:.1f}%')
             lines.append(f'- **Visited cells:** {self._coverage_visited}')
             lines.append(f'- **Total free cells:** {self._coverage_total}')
+            if self.nogo_skip_enabled:
+                lines.append('- *(no-go zone excluded from the free-cell denominator)*')
+
+        # Pseudo-YOLO no-go zone (hazard avoided)
+        if self.nogo_skip_enabled:
+            lines.append(f'\n## Pseudo-YOLO No-Go Zone ({self.nogo_label})\n')
+            lines.append(f'- **Hazard location (ground truth):** '
+                         f'({self.nogo_x:.2f}, {self.nogo_y:.2f})')
+            lines.append(f'- **Keep-out radius:** {self.nogo_radius:.2f} m '
+                         f'(+{self.safe_distance:.2f} m robot footprint → '
+                         f'{self.nogo_radius + self.safe_distance:.2f} m carved from the sweep)')
+            lines.append(f'- **YOLO detect range:** {self.yolo_detect_range:.2f} m '
+                         f'| **confidence:** {self.yolo_confidence:.2f}')
+            if self._nogo_event:
+                e = self._nogo_event
+                lines.append(f'- **Detected:** t={e["time"]:.1f}s, robot at '
+                             f'({e["robot_x"]:.2f}, {e["robot_y"]:.2f}), '
+                             f'{e["range_m"]:.2f} m from the hazard → zone skipped, '
+                             f'coverage continued.')
+            else:
+                lines.append('- **Detected:** not triggered '
+                             '(robot never came within detect range).')
+            lines.append('\nThe robot avoids this region and maps the gas plume '
+                         'around it. See `yolo_events.csv`.')
 
         # Hotspots detected
         if self._hotspots:
@@ -1524,6 +1649,8 @@ class AutoCoverageMapper(Node):
 
         lines.append(f'\n## Output Files\n')
         lines.append(f'- `readings.csv` — Full sensor readings (timestamp, x, y, gas_type, ppm, phase)')
+        if self.nogo_skip_enabled:
+            lines.append(f'- `yolo_events.csv` — Pseudo-YOLO hazard detection event(s)')
         lines.append(f'- `occupancy_grid.pgm` — Occupancy grid of the environment')
         lines.append(f'- `run_data.npz` — NumPy archive with all data arrays')
         lines.append(f'- `README.md` — This file')
@@ -1671,6 +1798,17 @@ class AutoCoverageMapper(Node):
             save_dict['coverage_pct'] = np.array(self._coverage_pct)
             save_dict['coverage_visited_cells'] = np.array(self._coverage_visited)
             save_dict['coverage_total_free_cells'] = np.array(self._coverage_total)
+
+        # Pseudo-YOLO no-go zone metadata
+        if self.nogo_skip_enabled:
+            save_dict['nogo_xy'] = np.array([self.nogo_x, self.nogo_y])
+            save_dict['nogo_radius'] = np.array(self.nogo_radius)
+            save_dict['nogo_label'] = np.array(self.nogo_label)
+            save_dict['nogo_detected'] = np.array(self._nogo_detected)
+            if self._nogo_event:
+                save_dict['nogo_detect_time'] = np.array(self._nogo_event['time'])
+                save_dict['nogo_detect_xy'] = np.array(
+                    [self._nogo_event['robot_x'], self._nogo_event['robot_y']])
 
         np.savez_compressed(npz_path, **save_dict)
         print(f"Saved NPZ archive: {npz_path}")
@@ -2025,12 +2163,25 @@ class AutoCoverageMapper(Node):
                                   edgecolor='gray', alpha=0.85),
                         family='monospace', zorder=6)
 
+            def _nogo(ax):
+                """Overlay the YOLO no-go zone (hazard the robot avoided)."""
+                if not self.nogo_skip_enabled:
+                    return
+                from matplotlib.patches import Circle
+                ax.add_patch(Circle((self.nogo_x, self.nogo_y), self.nogo_radius,
+                                    facecolor='red', alpha=0.18, edgecolor='red',
+                                    linewidth=1.8, hatch='xx', zorder=5.5))
+                ax.plot(self.nogo_x, self.nogo_y, marker='x', color='red',
+                        markersize=13, markeredgewidth=2.5, zorder=6.5,
+                        label=f'YOLO {self.nogo_label} (no-go)')
+
             # ── 1) Coverage path ──
             fig, ax = plt.subplots(figsize=(10, 8))
             sc = ax.scatter(xs, ys, c=ppm, cmap=CMAP,
                             norm=PowerNorm(gamma=0.4, vmin=0, vmax=ppm_max),
                             alpha=0.8, s=8, zorder=2, edgecolors='none')
             _walls(ax)
+            _nogo(ax)
             plt.colorbar(sc, ax=ax, label='Concentration (ppm)', shrink=0.82)
             ax.plot(peak_x, peak_y, 'r*', markersize=14, zorder=6,
                     markeredgecolor='black', markeredgewidth=0.5,
@@ -2052,6 +2203,7 @@ class AutoCoverageMapper(Node):
             ax.contour(xi, yi, zi_cont_smooth, levels=levels, colors='#555555',
                        linewidths=0.35, alpha=0.45, zorder=2)
             _walls(ax)
+            _nogo(ax)
             sm = plt.cm.ScalarMappable(cmap=CMAP, norm=norm_log)
             plt.colorbar(sm, ax=ax, label='Concentration (ppm)', shrink=0.82)
             ax.plot(peak_x, peak_y, 'r*', markersize=14, zorder=6,
@@ -2073,6 +2225,7 @@ class AutoCoverageMapper(Node):
             ax.contour(xi, yi, zi_cont_smooth, levels=levels, colors='#555555',
                        linewidths=0.35, alpha=0.45, zorder=2)
             _walls(ax)
+            _nogo(ax)
             sm2 = plt.cm.ScalarMappable(cmap=CMAP, norm=norm_pow)
             plt.colorbar(sm2, ax=ax, label='Concentration (ppm)', shrink=0.82)
             ax.plot(peak_x, peak_y, 'r*', markersize=14, zorder=6,

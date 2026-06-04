@@ -20,7 +20,10 @@ def launch_arguments():
         DeclareLaunchArgument("namespace", default_value="PioneerP3DX"),
         DeclareLaunchArgument("num_sensors", default_value="4",
                               description="Number of PID gas sensors to launch (1-4). "
-                                          "Exp_C=4, 10x6_empty_room=3, MAPIRlab/10x6_maze=2"),
+                                          "Exp_C=4, 10x6_empty_room=3, MAPIRlab/10x6_maze=2, dorm_room=1"),
+        DeclareLaunchArgument("gas1_target", default_value="ethanol",
+                              description="target_gas for the gas1 sensor (e.g. ethanol, methane, "
+                                          "carbonDioxide). dorm_room uses carbonDioxide."),
     ]
 # ==========================
 
@@ -127,7 +130,7 @@ def launch_setup(context, *args, **kwargs):
             name="gas1",
             parameters=[
                 {"sensor_model": 30},
-                {"target_gas": "ethanol"},
+                {"target_gas": LaunchConfiguration("gas1_target").perform(context)},
                 {"sensor_frame": parse_substitution("$(var namespace)_gas1_frame")},
                 {"fixed_frame": "map"},
                 {"noise_std": 0.1},

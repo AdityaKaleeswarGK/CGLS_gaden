@@ -1,0 +1,14 @@
+map: occupancy.yaml
+robots:
+  - name: PioneerP3DX
+    radius: 0.25
+    position: [2.7, 0.6, 0]
+    angle: 1.5708  # face +Y, into the room
+    sensors:
+      - type: laser
+        name: laser_scanner
+        minAngleRad: -2.2
+        maxAngleRad: 2.2
+        angleResolutionRad: 0.07
+        minDistance: 0.1
+        maxDistance: 4

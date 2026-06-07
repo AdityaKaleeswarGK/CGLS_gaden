@@ -15,3 +15,14 @@ build
 result
 OccupancyGrid3D.csv
 wind
+# --- Keep only the core logic files and results in root ---
+/*
+!/.gitignore
+!/auto_coverage_mapper.py
+!/concentration_mapper.py
+!/gas_viz.py
+!/plot_from_npz.py
+!/coverage_mapper_baseline.py
+!/README.md
+!/results/
+!/results/**

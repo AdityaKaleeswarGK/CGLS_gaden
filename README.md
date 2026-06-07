@@ -1,55 +1,108 @@
-# GADEN
+# Auto-Coverage and Gas Source Localization Benchmarking
 
-## A 3D Gas Dispersion Simulator for ROS
+**Disclaimer:** This repository contains only the core logic files and results for the adaptive auto-coverage mapping algorithm. It is designed to be executed within the [GADEN Simulation Environment](https://github.com/MAPIRlab/gaden.git).
 
-GADEN is a simulation framework designed for mobile robotics systems and gas sensing algorithms, also known as Mobile Robotics Olfaction (MRO). The framework is rooted in the principles of computational fluid dynamics and filament dispersion theory, modeling wind flow and gas dispersion in 3D scenarios and accounting for walls, furniture, and other objects that may have a significative impact on the gas dispersion.
+## Setup Instructions
 
-Moreover, it integrates the simulation of different environmental sensors, such as metal oxide gas sensors, photo-ionization detectors, T-DLAS or anemometers, as well as it is fully integrated with ROS and the navigation stack, making testing and validation much easier.
+To run these scripts, you will need the main GADEN repository.
 
-If you do not want to use ROS, gaden is available as a [standalone library](https://github.com/MAPIRlab/gaden_core) and a [graphical desktop application](https://github.com/MAPIRlab/gaden_gui).
+1. Clone the main [GADEN](https://github.com/MAPIRlab/gaden.git) repository into your ROS 2 workspace:
+   ```bash
+   cd ~/ros2_ws/src
+   git clone https://github.com/MAPIRlab/gaden.git
+   ```
+2. Clone this auto-coverage logic repository:
+   ```bash
+   git clone https://github.com/AdityaKaleeswarGK/CGLS_gaden.git
+   ```
+3. Copy the Python scripts from this repository into the GADEN test environment:
+   ```bash
+   cp CGLS_gaden/*.py gaden/test_env/scripts/
+   ```
+4. Build the `test_env` package:
+   ```bash
+   cd ~/ros2_ws
+   colcon build --packages-select test_env
+   source install/setup.bash
+   ```
 
-## Video showcase
-[![Video showcase](https://img.youtube.com/vi/2i3_pyV-MYU/hqdefault.jpg)](https://youtu.be/2i3_pyV-MYU)
+## Core Logic Files
 
-You can cite Gaden in your work using the following .bib:
+The essential logic and algorithms are implemented in the following core files:
 
+- **`auto_coverage_mapper.py`**: The primary ROS 2 node that drives the autonomous coverage robot. It employs an adaptive, CUSUM-based hotspot detection logic, shifting the robot from a fast, coarse boustrophedon sweep into reactive, fine-resolution local sweeps whenever gas hotspots are detected. It automatically captures sensor readings and builds a spatial dataset of the gas field.
+- **`concentration_mapper.py`**: A standalone ROS 2 node that records real-time gas sensor readings along the robot's trajectory. It interpolates these readings into comprehensive visual maps (concentration heatmaps, contour maps, gradient maps) and performs Bayesian source localization.
+- **`gas_viz.py`**: A shared, ROS-independent library handling all offline data analysis and plotting. It implements a physically-grounded Bayesian probabilistic source localization (1/r inversion), which outputs `P(source | readings)` regions instead of just single coordinate points. It generates rich visualizations, highlighting 50% and 90% highest-posterior-density areas.
+- **`plot_from_npz.py`**: A utility script to perform offline data re-processing. It can load saved `run_data.npz` files from prior mapper missions, re-compute the Bayesian source localizations using updated models, and regenerate the entire suite of analytical plots.
+
+---
+
+## Running the GADEN Process
+
+The GADEN environment requires four primary stages to execute the coverage benchmark end-to-end. Replace `SCEN` with your target scenario (e.g., `Exp_C`, `10x6_empty_room`, `MAPIRlab`).
+
+### Stage 1: Preprocessing
+Generate 3D/2D occupancy and wind grids from CAD models:
+```bash
+ros2 launch test_env gaden_preproc_launch.py scenario:=SCEN configuration:=config1
 ```
-@ARTICLE{gaden-rt-2025,
-    author = {Ojeda, Pepe and Monroy, Javier and Gonzalez-Jimenez, Javier},
-     title = {Gaden-RT: A Real Time and Interactive Gas Dispersion Simulator for Mobile Robotics},
-   journal = {SoftwareX},
-    volume = {32},
-      year = {2025},
-      issn = {2352-7110},
-       url = {https://www.sciencedirect.com/science/article/pii/S2352711025003541},
-       doi = {10.1016/j.softx.2025.102388}
-}
 
-@article{monroyGADEN3DGas2017,
-     title = {{{GADEN}}: {{A 3D}} Gas Dispersion Simulator for Mobile Robot Olfaction in Realistic Environments},
-    author = {Monroy, Javier and {Hernandez-Bennetts}, Victor and Fan, Han and Lilienthal, Achim and {Gonzalez-Jimenez}, Javier},
-      year = {2017},
-   journal = {Sensors (Switzerland)},
-    volume = {17},
-    number = {7},
-     pages = {1--16},
-       doi = {10.3390/s17071479},
-}
+### Stage 2: Filament Simulation
+Simulate gas dispersion. Run this once per source (e.g., `sim1`, `sim2`):
+```bash
+ros2 launch test_env gaden_sim_launch.py scenario:=SCEN configuration:=config1 simulation:=sim1
 ```
 
-## Installation
-Move to your colcon workspace and run
+### Stage 3: Robot and Sensors (Simulation Player)
+Launch the robot, Nav2 stack, simulated gas/wind sensors, and playback the GADEN simulation:
+```bash
+ros2 launch test_env main_simbot_launch.py \
+  scenario:=SCEN configuration:=config1 simulation:=sim1 \
+  namespace:=PioneerP3DX num_sensors:=2
+```
 
-`git clone --recurse-submodules git@github.com:MAPIRlab/gaden.git src/gaden`
+### Stage 4: Run the Auto-Coverage Mapper
+In a new sourced terminal, launch the adaptive coverage script from the GADEN repo:
+```bash
+python3 ~/ros2_ws/src/gaden/test_env/scripts/auto_coverage_mapper.py \
+  --ros-args -p generate_plots:=true \
+  -p scenario_path:=$HOME/ros2_ws/install/test_env/share/test_env/scenarios/SCEN/environment_configurations/config1
+```
+The robot will execute its sweeping strategy automatically. Upon completion (or manual Ctrl-C), results and figures will be saved to `~/gaden_results/auto_coverage/<timestamp>/`.
 
-It is important that you include the `--recurse-submodules` option, as the gaden repository includes submodules. if you already cloned in a non-recursive manner you can fix the problem by running 
+---
 
-`git submodule update --init --recursive`
+## Full Ablation Analysis and Results
 
-#### Dependencies
-Although GADEN is a self-contained pkg, the also included "simulated_sensor_pkgs" (anemometer and gas sensors) depends on an external pkg defining some "olfaction" related msgs. This pkg is available in a different repository [olfaction_msgs](https://github.com/MAPIRlab/olfaction_msgs)
+The core CUSUM-based adaptive approach was benchmarked against a non-reactive baseline (coarse lawnmower sweep only).
 
-## Usage
-See the [tutorial](GADEN_tutorial.md) for instructions on how to set up a simulation of your own or use the included [test environments](test_env).
+### Multi-Source Hazard Map Comparison (Exp_C Scenario)
 
-Users who want to test their algorithms in complex environments but do not need to simulate any specific scenario can find an extensive repository of existing simulations in the [VGR dataset](https://mapir.isa.uma.es/mapirwebsite/?p=1708), which features simulations in 3D models of real houses, along with the configuration files and intermediate data.
+The differences in spatial awareness are shown in the hazard maps. Blue in the difference map indicates where CUSUM estimates higher hazard (sharper, denser map near the true source). Red means Baseline estimates higher (gas spread more diffusely).
+
+**Hazard Map Comparison (CUSUM vs Baseline)**
+<p align="center">
+  <img src="results/abalation/hazard_diff_Exp_C.png" width="800" alt="Hazard Comparison - Exp_C" />
+</p>
+
+**Key Finding on Hazard Maps:**
+The CUSUM mapper produces a sharper, more source-centric hazard field because the reactive fine sweeps concentrate samples directly near the true sources. In the `Exp_C` environment, CUSUM estimates higher hazard in 11.0% of the map (concentrated near sources), validating the effectiveness of the targeted hotspot detection.
+
+### Localization Error Improvement
+Across tested scenarios, the CUSUM-based adaptive localization significantly reduced estimation errors:
+- **Multi-Source Hazard (Exp_C)**: 1.07m (Baseline) -> 0.54m (CUSUM) | **49% Improvement**
+- **MAPIRlab**: 1.53m (Baseline) -> 0.62m (CUSUM) | **59% Improvement**
+- **10x6 Empty Room**: 2.98m (Baseline) -> 2.69m (CUSUM) | **10% Improvement**
+
+<p align="center">
+  <img src="results/abalation/error_comparison.png" width="700" alt="Localization Error Comparison" />
+</p>
+
+### Map Coverage
+Because the CUSUM approach inserts additional fine-sweep waypoints upon detecting gas hotspots, it directly improved the overall map coverage:
+- **Exp_C**: CUSUM 55.9% vs Baseline 51.2% (+4.7%)
+- **Empty Room**: CUSUM 75.4% vs Baseline 58.8% (+16.6%)
+
+<p align="center">
+  <img src="results/abalation/coverage_comparison.png" width="700" alt="Coverage Comparison" />
+</p>

@@ -6,7 +6,7 @@
 
 To run these scripts, you will need the main GADEN repository.
 
-1. Clone the main [GADEN](https://github.com/MAPIRlab/gaden.git) repository into your ROS 2 workspace:
+1. Clone the main [GADEN](https://github.com/MAPIRlab/gaden.git) repository into your ROS 2 workspace and refer the setup in the attached repository:
    ```bash
    cd ~/ros2_ws/src
    git clone https://github.com/MAPIRlab/gaden.git

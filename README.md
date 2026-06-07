@@ -6,13 +6,20 @@
 
 To run these scripts, you will need the main GADEN repository.
 
-1. Clone the [GADEN](https://github.com/MAPIRlab/gaden.git) repository into your ROS 2 workspace:
+1. Clone the main [GADEN](https://github.com/MAPIRlab/gaden.git) repository into your ROS 2 workspace:
    ```bash
    cd ~/ros2_ws/src
    git clone https://github.com/MAPIRlab/gaden.git
    ```
-2. Copy the Python scripts from this repository (`auto_coverage_mapper.py`, `concentration_mapper.py`, `gas_viz.py`, `plot_from_npz.py`, `coverage_mapper_baseline.py`) into the `gaden/test_env/scripts/` folder.
-3. Build the `test_env` package:
+2. Clone this auto-coverage logic repository:
+   ```bash
+   git clone https://github.com/AdityaKaleeswarGK/CGLS_gaden.git
+   ```
+3. Copy the Python scripts from this repository into the GADEN test environment:
+   ```bash
+   cp CGLS_gaden/*.py gaden/test_env/scripts/
+   ```
+4. Build the `test_env` package:
    ```bash
    cd ~/ros2_ws
    colcon build --packages-select test_env

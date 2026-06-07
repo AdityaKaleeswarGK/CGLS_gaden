@@ -81,7 +81,9 @@ The core CUSUM-based adaptive approach was benchmarked against a non-reactive ba
 The differences in spatial awareness are shown in the hazard maps. Blue in the difference map indicates where CUSUM estimates higher hazard (sharper, denser map near the true source). Red means Baseline estimates higher (gas spread more diffusely).
 
 **Hazard Map Comparison (CUSUM vs Baseline)**
-![Hazard Comparison - Exp_C](results/abalation/hazard_diff_Exp_C.png)
+<p align="center">
+  <img src="results/abalation/hazard_diff_Exp_C.png" width="800" alt="Hazard Comparison - Exp_C" />
+</p>
 
 **Key Finding on Hazard Maps:**
 The CUSUM mapper produces a sharper, more source-centric hazard field because the reactive fine sweeps concentrate samples directly near the true sources. In the `Exp_C` environment, CUSUM estimates higher hazard in 11.0% of the map (concentrated near sources), validating the effectiveness of the targeted hotspot detection.
@@ -92,11 +94,15 @@ Across tested scenarios, the CUSUM-based adaptive localization significantly red
 - **MAPIRlab**: 1.53m (Baseline) -> 0.62m (CUSUM) | **59% Improvement**
 - **10x6 Empty Room**: 2.98m (Baseline) -> 2.69m (CUSUM) | **10% Improvement**
 
-<img src="results/abalation/error_comparison.png" width="500" alt="Localization Error Comparison" />
+<p align="center">
+  <img src="results/abalation/error_comparison.png" width="700" alt="Localization Error Comparison" />
+</p>
 
 ### Map Coverage
 Because the CUSUM approach inserts additional fine-sweep waypoints upon detecting gas hotspots, it directly improved the overall map coverage:
 - **Exp_C**: CUSUM 55.9% vs Baseline 51.2% (+4.7%)
 - **Empty Room**: CUSUM 75.4% vs Baseline 58.8% (+16.6%)
 
-<img src="results/abalation/coverage_comparison.png" width="500" alt="Coverage Comparison" />
+<p align="center">
+  <img src="results/abalation/coverage_comparison.png" width="700" alt="Coverage Comparison" />
+</p>

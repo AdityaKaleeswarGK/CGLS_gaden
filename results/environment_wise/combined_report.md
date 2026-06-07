@@ -30,41 +30,41 @@ Each environment is presented with two top-down views: the **Environment Layout*
 
 **Environment layout**
 
-![Exp_C layout](figures/layout_Exp_C.png)
+![Exp_C layout](layout_Exp_C.png)
 
 **CFD wind field**
 
-![Exp_C wind](figures/wind_Exp_C.png)
+![Exp_C wind](wind_Exp_C.png)
 
 ### 2.2 10x6 Empty Room
 
 **Environment layout**
 
-![empty_room layout](figures/layout_empty_room.png)
+![empty_room layout](layout_empty_room.png)
 
 **CFD wind field**
 
-![empty_room wind](figures/wind_empty_room.png)
+![empty_room wind](wind_empty_room.png)
 
 ### 2.3 MAPIRlab
 
 **Environment layout**
 
-![Mapirlab layout](figures/layout_Mapirlab.png)
+![Mapirlab layout](layout_Mapirlab.png)
 
 **CFD wind field**
 
-![Mapirlab wind](figures/wind_Mapirlab.png)
+![Mapirlab wind](wind_Mapirlab.png)
 
 ### 2.4 10x6 Maze
 
 **Environment layout**
 
-![maze layout](figures/layout_maze.png)
+![maze layout](layout_maze.png)
 
 **CFD wind field**
 
-![maze wind](figures/wind_maze.png)
+![maze wind](wind_maze.png)
 
 ### 2.5 Environment & Source Configuration
 
@@ -92,7 +92,7 @@ Each environment is presented with two top-down views: the **Environment Layout*
 | MAPIRlab | 0.62 | 0.32 | 4 | 47.5 |
 | 10x6 Maze | 0.53 | 0.28 | 3 | 51.2 |
 
-![per-world error](figures/err_per_world.png)
+![per-world error](err_per_world.png)
 
 ### 3.2 Per-gas localization detail
 
@@ -117,21 +117,21 @@ For each environment and active gas: mean error across runs, the predicted and t
 
 Per-gas localization error, grouped by environment and coloured by gas:
 
-![gas grouped error](figures/err_gas_grouped.png)
+![gas grouped error](err_gas_grouped.png)
 
-![per-gas error](figures/err_per_gas.png)
+![per-gas error](err_per_gas.png)
 
-![max ppm](figures/max_ppm.png)
+![max ppm](max_ppm.png)
 
 ### 3.4 Concentration vs. distance from source
 
 Every sensor reading plotted against the robot's distance to the ground-truth source (all runs pooled). Concentration rises sharply near the source and decays with distance, broadly following the theoretical 1/r reference — the signal structure the localizer exploits. Observations at larger distances carry reduced magnitude, turbulent-mixing scatter and delayed sensor recovery.
 
-![concentration vs distance](figures/conc_vs_distance.png)
+![concentration vs distance](conc_vs_distance.png)
 
 ### 3.5 Weighted hazard map — Multi-Source Hazard (Exp_C), best run
 
-![Exp_C hazard map](figures/hazard_Exp_C.png)
+![Exp_C hazard map](hazard_Exp_C.png)
 
 This map fuses every gas the robot measured during the **best-performing CUSUM run** of the multi-source room into a single, interpretable *risk surface*. It is constructed as follows:
 
@@ -161,9 +161,9 @@ The adaptive detector is characterised by **how early** it raises its first alar
 | 10x6 Maze | Ethanol | 2.1% | 1.7 |
 |  | Methane | — | 0.0 |
 
-![first alarm](figures/cusum_first_alarm.png)
+![first alarm](cusum_first_alarm.png)
 
-![re-triggers](figures/cusum_retriggers.png)
+![re-triggers](cusum_retriggers.png)
 
 High-concentration sources (e.g. propanol/ethanol with strong local gradients) trigger early, often within the first fraction of the mission, enabling a fast transition from coarse exploration to localized fine-sweep inspection. Weaker, low-concentration channels require longer exploration to accumulate sufficient statistical evidence before the alarm is confirmed, and the adaptive threshold keeps re-trigger counts low under turbulent dispersion.
 
@@ -178,19 +178,19 @@ High-concentration sources (e.g. propanol/ethanol with strong local gradients) t
 | MAPIRlab | 1.53 | 0.62 | 0.91 | 59.5% | 45.9 | 47.5 |
 | **Overall (mean)** | **1.86** | **1.29** | **0.58** | **30.9%** | | |
 
-![ablation error](figures/ablation_error.png)
+![ablation error](ablation_error.png)
 
-![ablation coverage](figures/ablation_coverage.png)
+![ablation coverage](ablation_coverage.png)
 
 ### 5.1 Map-wise comparison
 
 Mean localization error averaged across all gases per environment — Baseline vs. CUSUM (coloured by environment), with Δ and percentage improvement labelled:
 
-![map-wise error](figures/ablation_mapwise_error.png)
+![map-wise error](ablation_mapwise_error.png)
 
 CUSUM improvement over baseline per environment (positive = CUSUM reduces error):
 
-![map-wise improvement](figures/ablation_mapwise_improvement.png)
+![map-wise improvement](ablation_mapwise_improvement.png)
 
 ### 5.2 Hazard map comparison (CUSUM vs Baseline)
 
@@ -198,15 +198,15 @@ Three-panel comparison per environment: CUSUM | Baseline | Difference (blue = CU
 
 **Multi-Source Hazard (Exp_C)**
 
-![Exp_C hazard diff](figures/ablation_hazard_diff_Exp_C.png)
+![Exp_C hazard diff](ablation_hazard_diff_Exp_C.png)
 
 **10x6 Empty Room**
 
-![empty_room hazard diff](figures/ablation_hazard_diff_empty_room.png)
+![empty_room hazard diff](ablation_hazard_diff_empty_room.png)
 
 **MAPIRlab**
 
-![Mapirlab hazard diff](figures/ablation_hazard_diff_Mapirlab.png)
+![Mapirlab hazard diff](ablation_hazard_diff_Mapirlab.png)
 
 ### 5.3 Collective review
 

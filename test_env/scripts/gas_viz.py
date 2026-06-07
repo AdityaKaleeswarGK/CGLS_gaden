@@ -411,8 +411,10 @@ def concentration_intensity_map(out_path, label, xs, ys, ppm, baseline_mu=0.0,
 
     # Thin iso-concentration lines for low / moderate / high (no inline labels —
     # the quantitative band scale lives on the colourbar to avoid clutter).
-    band_levels = [e for e in edges[2:-1] if e > 0]
-    if band_levels:
+    # contour() requires STRICTLY increasing levels; np.maximum.accumulate can
+    # leave equal adjacent edges when the gas field is flat/sparse, so dedupe.
+    band_levels = np.unique([e for e in edges[2:-1] if e > 0])
+    if band_levels.size:
         ax.contour(xi, yi, zi, levels=band_levels, colors='#333333',
                    linewidths=0.5, alpha=0.4, zorder=3)
     # Highlighted PEAK region (top band) — "more gas here".

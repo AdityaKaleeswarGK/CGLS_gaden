@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """
-Adaptive Coverage Mapper – Two-phase BCD sweep with CUSUM spike detection.
+Baseline Coverage Mapper – single-phase boustrophedon (BCD) sweep.
 
-Phase 1: Coarse BCD sweep (wide step) surveys the whole environment.
-          A CUSUM change-point detector monitors gas readings in real-time.
-          When it fires, the (x,y) region is marked as a hotspot.
-
-Phase 2: For each detected hotspot, a tight local grid is generated and
-          swept for dense sampling near the gas source.
-
-The CUSUM detector is self-calibrating — it learns baseline mean and
-variance from the first N samples, so no hardcoded ppm thresholds are
-needed for spike detection.
+This is the ablation baseline for the adaptive (CUSUM) mapper. It performs ONE
+plain boustrophedon lawnmower sweep of the whole environment at a fixed step,
+collecting gas readings exactly the same way as the adaptive version (same CSV
+log, same live concentration grid, same source-localization estimator and
+plots). There is NO CUSUM detection, NO hotspot-triggered fine sweep, and NO
+reactive slowdown near gas — so any difference in localization accuracy vs. the
+adaptive mapper is attributable to the adaptive refinement alone.
 """
 import os
 import sys
@@ -38,10 +35,6 @@ from rclpy.executors import MultiThreadedExecutor
 
 from nav_msgs.msg import OccupancyGrid
 from nav2_msgs.action import NavigateToPose
-try:
-    from nav2_msgs.msg import SpeedLimit
-except ImportError:
-    SpeedLimit = None
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
 from olfaction_msgs.msg import GasSensor
@@ -58,102 +51,9 @@ except ImportError:
     pass
 
 
-# ────────────────────────────────────────────────────────────
-#  CUSUM Change-Point Detector
-# ────────────────────────────────────────────────────────────
-class CUSUMDetector:
-    """
-    Cumulative Sum (CUSUM) algorithm for online change-point detection.
-
-    Math:
-        S_n = max(0, S_{n-1} + x_n - mu_0 - drift)
-
-        When S_n > threshold_h → declare a spike.
-
-    Self-calibrating: collects `warmup` samples to estimate baseline
-    mean (mu_0) and stddev (sigma). Then:
-        drift = k * sigma      (sensitivity: lower k = more sensitive)
-        threshold_h = h * sigma (decision boundary)
-
-    O(1) per sample, no windowing, no hardcoded ppm values.
-    """
-
-    def __init__(self, warmup: int = 50, k: float = 0.5, h: float = 4.0,
-                 noise_floor: float = 0.1):
-        self.warmup = warmup
-        self.k_factor = k
-        self.h_factor = h
-        # Sensor-noise floor for sigma (ppm). Makes detection scale-invariant:
-        # weak gases that never reach an absolute ppm level are still detected
-        # when they rise significantly above each sensor's own baseline noise.
-        self.noise_floor = noise_floor
-
-        self._samples = []
-        self._calibrated = False
-        self._mu = 0.0
-        self._sigma = 1.0
-        self._drift = 0.0
-        self._threshold = float('inf')
-        self._S = 0.0  # cumulative sum
-
-    def update(self, value: float) -> bool:
-        """Feed a new sample. Returns True if a spike is active."""
-        if not self._calibrated:
-            self._samples.append(value)
-            if len(self._samples) >= self.warmup:
-                self._calibrate()
-            return False
-
-        self._S = max(0.0, self._S + value - self._mu - self._drift)
-        if self._S >= self._threshold:
-            return True
-        return False
-
-    def reset_alarm(self):
-        """Call after handling a spike to reset the cumulative sum."""
-        self._S = 0.0
-
-    def is_calibrated(self) -> bool:
-        return self._calibrated
-
-    @property
-    def current_S(self) -> float:
-        return self._S
-
-    @property
-    def threshold(self) -> float:
-        return self._threshold
-
-    @property
-    def baseline_mu(self) -> float:
-        """Calibrated baseline (pre-gas) mean — exported for the source-likelihood
-        noise model and the concentration-intensity 'trace' band."""
-        return self._mu
-
-    @property
-    def baseline_sigma(self) -> float:
-        """Calibrated baseline (pre-gas) std — the honest noise scale, used in
-        place of the global median (which over-counts plume samples)."""
-        return self._sigma
-
-    def _calibrate(self):
-        arr = np.array(self._samples)
-        self._mu = float(np.mean(arr))
-        # Floor sigma to the sensor-noise level (not a fixed 0.01). The drift
-        # and threshold are then purely relative to baseline noise, so a 0.5 ppm
-        # methane plume is just as detectable as a 30 ppm ethanol plume — both
-        # rise many sigma above their own (near-zero) baseline. No absolute ppm
-        # floor, which previously made sub-1-ppm gases impossible to detect.
-        self._sigma = max(float(np.std(arr)), self.noise_floor)
-        self._drift = self.k_factor * self._sigma
-        self._threshold = self.h_factor * self._sigma
-        self._calibrated = True
-        self._samples = []  # free memory
-
-
-class AutoCoverageMapper(Node):
+class CoverageMapperBaseline(Node):
     def __init__(self):
-        super().__init__('auto_coverage_mapper')
+        super().__init__('coverage_mapper_baseline')
         self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)])
 
         self.declare_parameter('namespace', 'PioneerP3DX')
@@ -163,99 +63,24 @@ class AutoCoverageMapper(Node):
             '/gas3/Sensor_reading',
             '/gas4/Sensor_reading',
         ])
-        # Adaptive sweep parameters
-        self.declare_parameter('coarse_step', 0.8)        # Phase 1: dense sweep
-        self.declare_parameter('fine_step', 0.4)          # Phase 2: tight sweep in hotspots
-        self.declare_parameter('hotspot_pad', 1.5)         # meters padding around hotspot center
+        # Boustrophedon sweep parameters
+        self.declare_parameter('coarse_step', 0.8)        # lawnmower lane spacing
         self.declare_parameter('safe_distance', 0.3)
         self.declare_parameter('nav_timeout', 30.0)
         self.declare_parameter('wp_tolerance', 0.5)
-        # CUSUM tuning
-        self.declare_parameter('cusum_warmup', 50)         # samples before calibration
-        self.declare_parameter('cusum_k', 0.75)            # drift sensitivity (higher = less sensitive)
-        self.declare_parameter('cusum_h', 5.0)             # decision threshold (higher = fewer triggers)
-        self.declare_parameter('cusum_noise_floor', 0.1)   # sensor-noise sigma floor (ppm); scale-invariant detection
-        # Hotspot validation gates — spike must pass ALL of these to become a fine-sweep region
-        self.declare_parameter('min_spike_samples', 15)    # spike must last at least N samples
-        self.declare_parameter('min_spike_peak_sigma', 3.0)  # peak must be > mean + N*sigma of baseline
-        self.declare_parameter('hotspot_min_abs_ppm', 0.3)  # small absolute floor (ppm); was 2.0 — blocked weak gases
-        self.declare_parameter('max_hotspots', 3)          # cap total fine-sweep regions
-        # Reactive refinement: fine-sweep a hotspot the moment it is confirmed
-        # during the coarse sweep (instead of deferring all refinement to the
-        # end). Densely samples near the source while the robot is still there,
-        # which is what makes localization accurate.
-        self.declare_parameter('reactive_refine', True)
-        # Slowdown
-        self.declare_parameter('gas_slowdown_speed', 0.15)  # deprecated (old direct-cmd_vel override)
-        # Reactive slowdown near gas, issued as a Nav2 speed limit so the
-        # controller keeps full steering + obstacle avoidance. Set enabled=False
-        # to A/B test against no slowdown.
-        self.declare_parameter('reactive_slowdown_enabled', True)
-        self.declare_parameter('gas_slowdown_pct', 30.0)  # % of max speed while a CUSUM is spiking
         # Output control
         self.declare_parameter('generate_plots', False)
         # Scenario config path (for README generation)
         self.declare_parameter('scenario_path', '')
-        # ── Pseudo-YOLO no-go zone (a hazard the robot must avoid, e.g. a fire) ──
-        # GADEN cannot simulate the hazard object itself, so it is modelled as a
-        # known ground-truth location. The zone is carved out of the coverage
-        # sweep (the lawnmower routes around it), and the first time the robot
-        # comes within yolo_detect_range a single high-confidence "detection" is
-        # logged (pseudo-YOLO). All OFF by default → other scenarios unaffected.
-        self.declare_parameter('nogo_skip_enabled', False)
-        self.declare_parameter('nogo_x', 0.0)
-        self.declare_parameter('nogo_y', 0.0)
-        self.declare_parameter('nogo_radius', 0.6)        # keep-out radius (m)
-        self.declare_parameter('nogo_label', 'hazard')    # label for logs/plots/README
-        self.declare_parameter('yolo_detect_range', 1.5)  # proximity that triggers detection (m)
-        self.declare_parameter('yolo_confidence', 0.92)   # pseudo detection confidence
-        # Optional per-topic gas-name overrides, e.g.
-        #   gas_labels:=['/gas1/Sensor_reading=carbonDioxide']
-        # (default [''] — a non-empty list so rclpy infers STRING_ARRAY; the
-        #  empty entry is ignored by the '=' check below)
-        self.declare_parameter('gas_labels', [''])
 
         self.ns = self.get_parameter('namespace').value
         self.topics = self.get_parameter('sensor_topics').value
         self.coarse_step = self.get_parameter('coarse_step').value
-        self.fine_step = self.get_parameter('fine_step').value
-        self.hotspot_pad = self.get_parameter('hotspot_pad').value
         self.safe_distance = self.get_parameter('safe_distance').value
         self.nav_timeout = self.get_parameter('nav_timeout').value
         self.wp_tolerance = self.get_parameter('wp_tolerance').value
-        self.gas_slowdown_speed = self.get_parameter('gas_slowdown_speed').value
-        self.reactive_slowdown_enabled = self.get_parameter('reactive_slowdown_enabled').value
-        self.gas_slowdown_pct = self.get_parameter('gas_slowdown_pct').value
         self.generate_plots = self.get_parameter('generate_plots').value
         self.scenario_path = self.get_parameter('scenario_path').value
-        self.nogo_skip_enabled = self.get_parameter('nogo_skip_enabled').value
-        self.nogo_x = self.get_parameter('nogo_x').value
-        self.nogo_y = self.get_parameter('nogo_y').value
-        self.nogo_radius = self.get_parameter('nogo_radius').value
-        self.nogo_label = self.get_parameter('nogo_label').value
-        self.yolo_detect_range = self.get_parameter('yolo_detect_range').value
-        self.yolo_confidence = self.get_parameter('yolo_confidence').value
-        self._nogo_detected = False
-        self._nogo_event = None
-        # If the no-go is enabled but no centre was given, treat the gas SOURCE
-        # as the hazard (e.g. fire) and auto-centre the keep-out on it, read
-        # from the scenario's sim.yaml. Gated on nogo_skip_enabled, so other
-        # scenarios are unaffected.
-        if self.nogo_skip_enabled and self.nogo_x == 0.0 and self.nogo_y == 0.0:
-            _srcs = self._parse_true_sources()
-            if _srcs:
-                self.nogo_x, self.nogo_y = _srcs[0]['x'], _srcs[0]['y']
-                self.get_logger().info(
-                    f"No-go auto-centred on gas source "
-                    f"({self.nogo_x:.2f}, {self.nogo_y:.2f}) from sim.yaml")
-        self.min_spike_samples = self.get_parameter('min_spike_samples').value
-        self.min_spike_peak_sigma = self.get_parameter('min_spike_peak_sigma').value
-        self.max_hotspots = self.get_parameter('max_hotspots').value
-        self.reactive_refine = self.get_parameter('reactive_refine').value
-        # Reactive-refinement state (shared between sensor callback and nav thread)
-        self._reactive_queue = []      # confirmed hotspots awaiting a local fine sweep
-        self._refined_centers = []     # (x, y) already refined — Phase 2 skips these
-        self._in_reactive = False      # guard against re-entrant reactive sweeps
 
         # Sensor type mapping: topic → gas name for CSV gas_type column
         self._sensor_type_map = {
@@ -264,52 +89,22 @@ class AutoCoverageMapper(Node):
             '/gas3/Sensor_reading': 'hydrogen',
             '/gas4/Sensor_reading': 'propanol',
         }
-        # Optional per-topic gas-name overrides (e.g. gas1 retargeted to CO2)
-        for entry in (self.get_parameter('gas_labels').value or []):
-            if '=' in entry:
-                topic, label = entry.split('=', 1)
-                self._sensor_type_map[topic.strip()] = label.strip()
-
-        # CUSUM detector — one per sensor topic (independent calibration & thresholds)
-        cusum_warmup = self.get_parameter('cusum_warmup').value
-        cusum_k = self.get_parameter('cusum_k').value
-        cusum_h = self.get_parameter('cusum_h').value
-        cusum_noise_floor = self.get_parameter('cusum_noise_floor').value
-        self.hotspot_min_abs_ppm = self.get_parameter('hotspot_min_abs_ppm').value
-        self._cusum_params = (cusum_warmup, cusum_k, cusum_h, cusum_noise_floor)
-
-        self._cusums = {}              # topic → CUSUMDetector
-        self._cusum_spiking = {}       # topic → bool
-        self._spike_positions = {}     # topic → [(x, y, ppm), ...] during active spike
-        for t in self.topics:
-            self._cusums[t] = CUSUMDetector(warmup=cusum_warmup, k=cusum_k, h=cusum_h,
-                                            noise_floor=cusum_noise_floor)
-            self._cusum_spiking[t] = False
-            self._spike_positions[t] = []
 
         self.cbg = ReentrantCallbackGroup()
         self.nav_client = ActionClient(self, NavigateToPose, f'/{self.ns}/navigate_to_pose', callback_group=self.cbg)
         self.cmd_vel_pub = self.create_publisher(Twist, f'/{self.ns}/cmd_vel', 10)
-        # Speed-limit channel: Nav2 controller_server subscribes to <ns>/speed_limit
-        # and scales its OWN output, so we slow near gas without ever touching
-        # cmd_vel directly — Nav2 retains full collision avoidance.
-        self.speed_limit_pub = (self.create_publisher(SpeedLimit, f'/{self.ns}/speed_limit', 10)
-                                if SpeedLimit is not None else None)
-        self._speed_limited = False    # True when a reduced speed limit is currently set
 
-        self.all_waypoints = []        # coarse path (for plotting)
-        self.refinement_waypoints = [] # fine path (for plotting)
+        self.all_waypoints = []        # sweep path (for plotting)
+        self.refinement_waypoints = [] # unused in baseline — kept empty for downstream compatibility
         self.robot_x = 0.0
         self.robot_y = 0.0
         self._gt_pose_received = False  # True once ground_truth gives us a valid pose
         self.start_x = 0.0
         self.start_y = 0.0
         self._running = True
-        self._any_cusum_spiking = False  # True if ANY sensor is currently spiking
 
-        # Hotspot bounding boxes: {topic: [(cx, cy, peak_ppm), ...]}
-        self._hotspots_per_topic = {t: [] for t in self.topics}
-        # Merged hotspots for fine sweep (union of all topics)
+        # No hotspots in the baseline — kept empty so the shared save/plot code
+        # (which references these) runs unchanged.
         self._hotspots = []
 
         self.clear_local = self.create_client(Empty, f'/{self.ns}/local_costmap/clear_entirely_local_costmap')
@@ -401,9 +196,8 @@ class AutoCoverageMapper(Node):
         self._conc_publish_timer = None  # started after map received
 
         self.get_logger().info(
-            f"Adaptive Coverage Mapper initialized. "
-            f"Coarse={self.coarse_step}m, Fine={self.fine_step}m, "
-            f"CUSUM k={cusum_k}, h={cusum_h}. "
+            f"Baseline Coverage Mapper initialized (boustrophedon, no refinement). "
+            f"Step={self.coarse_step}m. "
             f"CSV log: {self._csv_path}"
         )
 
@@ -505,133 +299,6 @@ class AutoCoverageMapper(Node):
             # Update live concentration grid
             self._update_conc_grid(self.robot_x, self.robot_y, msg.raw)
 
-            # Feed this topic's own CUSUM
-            cusum = self._cusums[topic]
-            spiking = cusum.update(msg.raw)
-
-            if spiking and not self._cusum_spiking[topic]:
-                self._cusum_spiking[topic] = True
-                self._spike_positions[topic] = []
-                self.get_logger().info(
-                    f"CUSUM SPIKE [{topic}] at ({self.robot_x:.2f}, {self.robot_y:.2f}) "
-                    f"ppm={msg.raw:.2f}, S={cusum.current_S:.2f}/{cusum.threshold:.2f}"
-                )
-            if spiking:
-                self._spike_positions[topic].append((self.robot_x, self.robot_y, msg.raw))
-            elif self._cusum_spiking[topic]:
-                # Spike ended for this topic
-                self._finalize_hotspot(topic)
-                self._cusum_spiking[topic] = False
-                cusum.reset_alarm()
-
-            # Update aggregate flag (used for slowdown during navigation)
-            self._any_cusum_spiking = any(self._cusum_spiking.values())
-
-    def _finalize_hotspot(self, topic):
-        """Convert accumulated spike samples into a hotspot — only if it passes validation."""
-        positions = self._spike_positions[topic]
-        if not positions:
-            return
-        arr = np.array(positions)  # (N, 3): x, y, ppm
-        num_samples = len(arr)
-        peak_ppm = float(arr[:, 2].max())
-
-        # ── Gate 1: Minimum duration (not a transient blip) ──
-        if num_samples < self.min_spike_samples:
-            self.get_logger().info(
-                f"Spike REJECTED [{topic}]: only {num_samples} samples "
-                f"(need {self.min_spike_samples}). Transient noise."
-            )
-            self._spike_positions[topic] = []
-            return
-
-        # ── Gate 2: Minimum absolute concentration ──
-        min_abs_ppm = self.hotspot_min_abs_ppm  # small noise floor; relative gate does the real work
-        if peak_ppm < min_abs_ppm:
-            self.get_logger().info(
-                f"Spike REJECTED [{topic}]: peak {peak_ppm:.2f} ppm < "
-                f"minimum absolute threshold {min_abs_ppm} ppm. Background dispersion."
-            )
-            self._spike_positions[topic] = []
-            return
-
-        # ── Gate 3: Peak must be significantly above baseline ──
-        cusum = self._cusums[topic]
-        if cusum.is_calibrated():
-            baseline_threshold = cusum._mu + self.min_spike_peak_sigma * cusum._sigma
-            if peak_ppm < baseline_threshold:
-                self.get_logger().info(
-                    f"Spike REJECTED [{topic}]: peak {peak_ppm:.2f} ppm < "
-                    f"baseline threshold {baseline_threshold:.2f} ppm "
-                    f"(mean={cusum._mu:.2f} + {self.min_spike_peak_sigma}σ={cusum._sigma:.2f})"
-                )
-                self._spike_positions[topic] = []
-                return
-
-        # ── Passed validation — compute weighted centroid ──
-        weights = arr[:, 2]
-        total_w = weights.sum()
-        if total_w > 0:
-            cx = float(np.average(arr[:, 0], weights=weights))
-            cy = float(np.average(arr[:, 1], weights=weights))
-        else:
-            cx = float(np.mean(arr[:, 0]))
-            cy = float(np.mean(arr[:, 1]))
-
-        # Merge with existing hotspot for this topic if overlapping
-        topic_hotspots = self._hotspots_per_topic[topic]
-        for i, (hx, hy, hp) in enumerate(topic_hotspots):
-            if math.hypot(cx - hx, cy - hy) < self.hotspot_pad:
-                if peak_ppm > hp:
-                    topic_hotspots[i] = (cx, cy, peak_ppm)
-                self.get_logger().info(
-                    f"Hotspot merged [{topic}] at ({cx:.2f}, {cy:.2f}), peak={peak_ppm:.1f}"
-                )
-                self._spike_positions[topic] = []
-                return
-
-        topic_hotspots.append((cx, cy, peak_ppm))
-        self.get_logger().info(
-            f"CONFIRMED HOTSPOT [{topic}] #{len(topic_hotspots)} at ({cx:.2f}, {cy:.2f}), "
-            f"peak={peak_ppm:.1f} ppm, {num_samples} samples"
-        )
-        # Queue for an immediate local fine sweep (drained by the nav thread
-        # between coarse waypoints) unless this area was already refined.
-        if self.reactive_refine and not any(
-                math.hypot(cx - rx, cy - ry) < self.hotspot_pad
-                for rx, ry in self._refined_centers):
-            self._reactive_queue.append((cx, cy, peak_ppm))
-        self._spike_positions[topic] = []
-
-    def _merge_all_hotspots(self):
-        """Merge hotspots from all topics into one list for fine sweep.
-        Overlapping hotspots from different gases get combined.
-        Capped at max_hotspots, keeping the highest-peak ones."""
-        self._hotspots = []
-        for topic, topic_hotspots in self._hotspots_per_topic.items():
-            for cx, cy, peak_ppm in topic_hotspots:
-                merged = False
-                for i, (hx, hy, hp) in enumerate(self._hotspots):
-                    if math.hypot(cx - hx, cy - hy) < self.hotspot_pad:
-                        if peak_ppm > hp:
-                            self._hotspots[i] = (cx, cy, peak_ppm)
-                        merged = True
-                        break
-                if not merged:
-                    self._hotspots.append((cx, cy, peak_ppm))
-
-        # Cap at max_hotspots — keep the strongest ones
-        if len(self._hotspots) > self.max_hotspots:
-            self._hotspots.sort(key=lambda h: h[2], reverse=True)
-            dropped = len(self._hotspots) - self.max_hotspots
-            self._hotspots = self._hotspots[:self.max_hotspots]
-            self.get_logger().info(f"Capped hotspots: dropped {dropped} weakest regions")
-
-        self.get_logger().info(
-            f"Merged hotspots from {len(self.topics)} topics → "
-            f"{len(self._hotspots)} regions for fine sweep"
-        )
-
     def map_cb(self, msg: OccupancyGrid):
         self.saved_map_msg = msg
         # Initialize live concentration grid once we know map bounds
@@ -698,55 +365,6 @@ class AutoCoverageMapper(Node):
         self._conc_pub.publish(msg)
 
     # ────────────────────────────────────────────────────────────
-    #  Pseudo-YOLO no-go zone (a hazard the robot must avoid, e.g. fire)
-    # ────────────────────────────────────────────────────────────
-    def _in_nogo_zone(self, x, y):
-        """True if (x, y) falls inside the keep-out circle (inflated by the
-        robot footprint), so the coverage planner routes around the hazard."""
-        if not self.nogo_skip_enabled:
-            return False
-        r = self.nogo_radius + self.safe_distance
-        return math.hypot(x - self.nogo_x, y - self.nogo_y) <= r
-
-    def _check_yolo_nogo(self):
-        """Pseudo-YOLO: the first time the robot comes within yolo_detect_range
-        of the hazard, log one high-confidence detection. The no-go zone is
-        already carved out of the sweep — this records the 'trigger' moment for
-        the README/plots and appends to yolo_events.csv."""
-        if not self.nogo_skip_enabled or self._nogo_detected:
-            return
-        self._update_robot_pose()
-        d = math.hypot(self.robot_x - self.nogo_x, self.robot_y - self.nogo_y)
-        if d > self.yolo_detect_range:
-            return
-        self._nogo_detected = True
-        stamp = self.get_clock().now().nanoseconds / 1e9
-        self._nogo_event = {
-            'time': stamp, 'conf': self.yolo_confidence, 'label': self.nogo_label,
-            'hazard_x': self.nogo_x, 'hazard_y': self.nogo_y,
-            'robot_x': self.robot_x, 'robot_y': self.robot_y, 'range_m': d,
-        }
-        self.get_logger().warning(
-            f"🟥 YOLO {self.nogo_label.upper()} DETECTED "
-            f"(conf={self.yolo_confidence:.2f}) at ({self.nogo_x:.2f}, {self.nogo_y:.2f}) "
-            f"— robot {d:.2f} m away. Keep-out r={self.nogo_radius:.2f} m; "
-            f"skipping it and covering the rest."
-        )
-        try:
-            ev = os.path.join(self._run_dir, 'yolo_events.csv')
-            new = not os.path.exists(ev)
-            with open(ev, 'a', newline='') as f:
-                wr = csv.writer(f)
-                if new:
-                    wr.writerow(['time', 'label', 'hazard_x', 'hazard_y', 'confidence',
-                                 'robot_x', 'robot_y', 'detect_range_m', 'nogo_radius_m'])
-                wr.writerow([f'{stamp:.3f}', self.nogo_label, self.nogo_x, self.nogo_y,
-                             self.yolo_confidence, f'{self.robot_x:.3f}',
-                             f'{self.robot_y:.3f}', f'{d:.3f}', self.nogo_radius])
-        except Exception:
-            pass
-
-    # ────────────────────────────────────────────────────────────
     #  BCD Path Generation (parameterized by step size + optional bbox)
     # ────────────────────────────────────────────────────────────
     def _generate_bcd_waypoints(self, step, bbox=None):
@@ -789,10 +407,6 @@ class AutoCoverageMapper(Node):
                     cmin, cmax = max(0, c - s_cells), min(w - 1, c + s_cells)
                     chunk = data[rmin:rmax + 1, cmin:cmax + 1]
                     free = chunk.size > 0 and np.all((chunk >= 0) & (chunk < 40))
-
-                    # Pseudo-YOLO no-go zone: treat as not-free so laps split around it
-                    if free and self._in_nogo_zone(cx, cy):
-                        free = False
 
                     if free:
                         if c_start is None:
@@ -906,7 +520,7 @@ class AutoCoverageMapper(Node):
         self.path_timer.cancel()
 
         msg = self.saved_map_msg
-        self.get_logger().info("Map received! Generating COARSE BCD sweep...")
+        self.get_logger().info("Map received! Generating boustrophedon BCD sweep...")
 
         res = msg.info.resolution
         w = msg.info.width
@@ -915,11 +529,10 @@ class AutoCoverageMapper(Node):
         self.map_data = data
         self.map_info = msg.info
 
-        # Phase 1: coarse sweep
+        # Single boustrophedon sweep (no refinement phase)
         self.all_waypoints = self._generate_bcd_waypoints(self.coarse_step)
         self.get_logger().info(
-            f"Coarse sweep: {len(self.all_waypoints)} waypoints at {self.coarse_step}m step. "
-            f"CUSUM will detect hotspots for Phase 2 refinement."
+            f"Boustrophedon sweep: {len(self.all_waypoints)} waypoints at {self.coarse_step}m step."
         )
 
         nav_thread = threading.Thread(target=self._run_navigation, daemon=True)
@@ -931,52 +544,10 @@ class AutoCoverageMapper(Node):
     def _run_navigation(self):
         self.nav_client.wait_for_server()
 
-        # ── Phase 1: Coarse sweep ──
+        # ── Single boustrophedon coverage sweep (baseline, no refinement) ──
         self._current_phase = 'coarse'
-        self.get_logger().info("═══ PHASE 1: Coarse coverage sweep ═══")
-        coarse_skipped = self._execute_waypoints(self.all_waypoints, phase_label="Coarse")
-
-        # Finalize any in-progress spikes across all topics
-        for topic in self.topics:
-            if self._cusum_spiking[topic]:
-                self._finalize_hotspot(topic)
-                self._cusum_spiking[topic] = False
-
-        # Merge hotspots from all sensor topics into unified fine-sweep regions
-        self._merge_all_hotspots()
-
-        # ── Phase 2: Refine hotspots ──
-        if self._hotspots:
-            self._current_phase = 'fine'
-            self.get_logger().info(
-                f"═══ PHASE 2: Refining {len(self._hotspots)} hotspot(s) "
-                f"at {self.fine_step}m resolution ═══"
-            )
-            for i, (hx, hy, hp) in enumerate(self._hotspots):
-                # Skip hotspots already covered by a reactive fine sweep
-                if any(math.hypot(hx - rx, hy - ry) < self.hotspot_pad
-                       for rx, ry in self._refined_centers):
-                    self.get_logger().info(
-                        f"Hotspot #{i + 1} ({hx:.2f}, {hy:.2f}) already refined "
-                        f"reactively — skipping."
-                    )
-                    continue
-                bbox = (
-                    hx - self.hotspot_pad,
-                    hy - self.hotspot_pad,
-                    hx + self.hotspot_pad,
-                    hy + self.hotspot_pad,
-                )
-                fine_wps = self._generate_bcd_waypoints(self.fine_step, bbox=bbox)
-                self.refinement_waypoints.extend(fine_wps)
-                self.get_logger().info(
-                    f"Hotspot #{i + 1} ({hx:.2f}, {hy:.2f}, peak={hp:.1f} ppm): "
-                    f"{len(fine_wps)} fine waypoints in "
-                    f"[{bbox[0]:.1f},{bbox[1]:.1f}]→[{bbox[2]:.1f},{bbox[3]:.1f}]"
-                )
-                self._execute_waypoints(fine_wps, phase_label=f"Refine#{i + 1}")
-        else:
-            self.get_logger().info("No hotspots detected — skipping Phase 2 refinement.")
+        self.get_logger().info("═══ Boustrophedon coverage sweep (baseline) ═══")
+        self._execute_waypoints(self.all_waypoints, phase_label="Sweep")
 
         total_coarse = len(self.all_waypoints)
         total_fine = len(self.refinement_waypoints)
@@ -1005,20 +576,10 @@ class AutoCoverageMapper(Node):
         max_consecutive_failures = 2
         consecutive_failures = 0
         last_good_x, last_good_y = self.robot_x, self.robot_y
-        # Start the phase unrestricted; reactive slowdown re-applies as gas appears.
-        self._speed_limited = False
-        self._set_speed_limit(100.0)
 
         for idx, (wx, wy) in enumerate(waypoints):
             if not rclpy.ok() or not self._running:
                 break
-
-            # Pseudo-YOLO: fire the detection event once the robot is near the
-            # hazard, and never drive a waypoint that lies inside the no-go zone.
-            self._check_yolo_nogo()
-            if self.nogo_skip_enabled and self._in_nogo_zone(wx, wy):
-                skipped += 1
-                continue
 
             if not self._is_waypoint_reachable(wx, wy):
                 skipped += 1
@@ -1030,12 +591,6 @@ class AutoCoverageMapper(Node):
             if success:
                 consecutive_failures = 0
                 last_good_x, last_good_y = wx, wy
-                # React to hotspots confirmed while sweeping: fine-sweep them now,
-                # while the robot is still nearby. Only during the coarse phase
-                # and never re-entrantly (a reactive sweep won't spawn another).
-                if (phase_label == "Coarse" and self.reactive_refine
-                        and not self._in_reactive and self._reactive_queue):
-                    self._do_reactive_refine()
             else:
                 skipped += 1
                 consecutive_failures += 1
@@ -1061,35 +616,6 @@ class AutoCoverageMapper(Node):
 
         self.get_logger().info(f"[{phase_label}] Done: {total - skipped}/{total} waypoints reached.")
         return skipped
-
-    def _do_reactive_refine(self):
-        """Drain the reactive hotspot queue: run a tight fine sweep around each
-        freshly-confirmed hotspot immediately, then return to the coarse sweep.
-        This is what gives the localizer dense, near-source samples."""
-        self._in_reactive = True
-        prev_phase = self._current_phase
-        try:
-            while self._reactive_queue and rclpy.ok() and self._running:
-                hx, hy, hp = self._reactive_queue.pop(0)
-                if any(math.hypot(hx - rx, hy - ry) < self.hotspot_pad
-                       for rx, ry in self._refined_centers):
-                    continue
-                bbox = (hx - self.hotspot_pad, hy - self.hotspot_pad,
-                        hx + self.hotspot_pad, hy + self.hotspot_pad)
-                fine_wps = self._generate_bcd_waypoints(self.fine_step, bbox=bbox)
-                if not fine_wps:
-                    continue
-                self.refinement_waypoints.extend(fine_wps)
-                self._refined_centers.append((hx, hy))
-                self._current_phase = 'fine'
-                self.get_logger().info(
-                    f"⚡ REACTIVE refine at ({hx:.2f}, {hy:.2f}) peak={hp:.1f} ppm: "
-                    f"{len(fine_wps)} fine waypoints (interrupting coarse sweep)"
-                )
-                self._execute_waypoints(fine_wps, phase_label="ReactiveRefine")
-        finally:
-            self._current_phase = prev_phase
-            self._in_reactive = False
 
     # ────────────────────────────────────────────────────────────
     #  Laser scan callback & helpers
@@ -1315,22 +841,6 @@ class AutoCoverageMapper(Node):
         except Exception:
             pass
 
-    def _set_speed_limit(self, pct: float):
-        """Ask Nav2 to cap speed at ``pct`` % of max (100 = unrestricted).
-
-        Consumed by controller_server's built-in ``speed_limit`` subscription, so
-        Nav2 scales its own velocity and keeps doing collision avoidance — we
-        never publish cmd_vel here. No-op if nav2_msgs/SpeedLimit is unavailable
-        (the robot then simply runs at full speed near gas, which is still safe).
-        """
-        if self.speed_limit_pub is None:
-            return
-        msg = SpeedLimit()
-        msg.header.frame_id = 'map'
-        msg.percentage = True
-        msg.speed_limit = float(pct)
-        self.speed_limit_pub.publish(msg)
-
     def _navigate_to(self, x: float, y: float) -> bool:
         self._update_robot_pose()
         dist = math.hypot(self.robot_x - x, self.robot_y - y)
@@ -1397,19 +907,6 @@ class AutoCoverageMapper(Node):
                 result_event.wait(timeout=2.0)
                 break
 
-            # Reactive slowdown near gas — issued as a Nav2 speed limit (not a
-            # direct cmd_vel command). The controller server caps its own speed
-            # while keeping full steering + obstacle avoidance, so we no longer
-            # fight Nav2 and bump in tight, gas-filled passages. Published only on
-            # state transitions to avoid topic spam.
-            if self.reactive_slowdown_enabled:
-                if self._any_cusum_spiking and not self._speed_limited:
-                    self._set_speed_limit(self.gas_slowdown_pct)
-                    self._speed_limited = True
-                elif not self._any_cusum_spiking and self._speed_limited:
-                    self._set_speed_limit(100.0)
-                    self._speed_limited = False
-
         self._update_robot_pose()
         dist = math.hypot(self.robot_x - x, self.robot_y - y)
         if dist <= self.wp_tolerance:
@@ -1437,15 +934,6 @@ class AutoCoverageMapper(Node):
 
         # Free cells: occupancy value 0 (definitely free)
         free_mask = (self.map_data >= 0) & (self.map_data < 40)
-        # The robot is meant to skip the YOLO no-go zone, so don't count those
-        # cells against coverage — exclude them from the free-cell denominator.
-        if self.nogo_skip_enabled:
-            ys_idx, xs_idx = np.nonzero(free_mask)
-            wxs = ox + (xs_idx + 0.5) * res
-            wys = oy + (ys_idx + 0.5) * res
-            inside = np.hypot(wxs - self.nogo_x, wys - self.nogo_y) <= \
-                (self.nogo_radius + self.safe_distance)
-            free_mask[ys_idx[inside], xs_idx[inside]] = False
         total_free = int(np.sum(free_mask))
         if total_free == 0:
             return 0.0
@@ -1482,7 +970,7 @@ class AutoCoverageMapper(Node):
         lines.append(f'**Run ID:** {self._run_id}\n')
         lines.append(f'**Robot Start Position:** ({self.start_x:.2f}, {self.start_y:.2f})\n')
         lines.append(f'**Namespace:** {self.ns}\n')
-        lines.append(f'**Coarse Step:** {self.coarse_step}m | **Fine Step:** {self.fine_step}m\n')
+        lines.append(f'**Sweep Step:** {self.coarse_step}m (boustrophedon baseline — no refinement)\n')
 
         # Sensor configuration
         lines.append('\n## Sensors\n')
@@ -1579,30 +1067,6 @@ class AutoCoverageMapper(Node):
             lines.append(f'- **Map coverage:** {self._coverage_pct:.1f}%')
             lines.append(f'- **Visited cells:** {self._coverage_visited}')
             lines.append(f'- **Total free cells:** {self._coverage_total}')
-            if self.nogo_skip_enabled:
-                lines.append('- *(no-go zone excluded from the free-cell denominator)*')
-
-        # Pseudo-YOLO no-go zone (hazard avoided)
-        if self.nogo_skip_enabled:
-            lines.append(f'\n## Pseudo-YOLO No-Go Zone ({self.nogo_label})\n')
-            lines.append(f'- **Hazard location (ground truth):** '
-                         f'({self.nogo_x:.2f}, {self.nogo_y:.2f})')
-            lines.append(f'- **Keep-out radius:** {self.nogo_radius:.2f} m '
-                         f'(+{self.safe_distance:.2f} m robot footprint → '
-                         f'{self.nogo_radius + self.safe_distance:.2f} m carved from the sweep)')
-            lines.append(f'- **YOLO detect range:** {self.yolo_detect_range:.2f} m '
-                         f'| **confidence:** {self.yolo_confidence:.2f}')
-            if self._nogo_event:
-                e = self._nogo_event
-                lines.append(f'- **Detected:** t={e["time"]:.1f}s, robot at '
-                             f'({e["robot_x"]:.2f}, {e["robot_y"]:.2f}), '
-                             f'{e["range_m"]:.2f} m from the hazard → zone skipped, '
-                             f'coverage continued.')
-            else:
-                lines.append('- **Detected:** not triggered '
-                             '(robot never came within detect range).')
-            lines.append('\nThe robot avoids this region and maps the gas plume '
-                         'around it. See `yolo_events.csv`.')
 
         # Hotspots detected
         if self._hotspots:
@@ -1674,8 +1138,6 @@ class AutoCoverageMapper(Node):
 
         lines.append(f'\n## Output Files\n')
         lines.append(f'- `readings.csv` — Full sensor readings (timestamp, x, y, gas_type, ppm, phase)')
-        if self.nogo_skip_enabled:
-            lines.append(f'- `yolo_events.csv` — Pseudo-YOLO hazard detection event(s)')
         lines.append(f'- `occupancy_grid.pgm` — Occupancy grid of the environment')
         lines.append(f'- `run_data.npz` — NumPy archive with all data arrays')
         lines.append(f'- `README.md` — This file')
@@ -1731,18 +1193,6 @@ class AutoCoverageMapper(Node):
     # ────────────────────────────────────────────────────────────
     def _save_data(self):
         """Save all collected data as NPZ archive for future analysis."""
-        # Stop the sensor callbacks from appending while we read the dataset, so
-        # the snapshot stays consistent across _save_data / metrics / plotting.
-        self._running = False
-        # Let any callback that was already mid-append finish (each appends one
-        # value to x/y/ppm/timestamp), then trim every buffer to its common
-        # length ONCE. After this all four lists are equal-length and frozen, so
-        # every downstream reader (_save_data, metrics, plots) is race-free.
-        time.sleep(0.2)
-        for d in self.dataset.values():
-            m = min(len(d['x']), len(d['y']), len(d['ppm']), len(d['timestamp']))
-            for k in ('x', 'y', 'ppm', 'timestamp'):
-                del d[k][m:]
         npz_path = os.path.join(self._run_dir, 'run_data.npz')
 
         save_dict = {}
@@ -1762,28 +1212,20 @@ class AutoCoverageMapper(Node):
 
         for t, d in self.dataset.items():
             clean = t.replace('/', '_').strip('_')
-            # Snapshot to a consistent length. The sensor callback runs in another
-            # thread and can append mid-save, leaving the four lists off-by-one;
-            # truncating to their common minimum keeps every array (and the ppm
-            # masks built from them) aligned.
-            n = min(len(d['x']), len(d['y']), len(d['ppm']), len(d['timestamp']))
-            xs, ys_arr = np.array(d['x'][:n]), np.array(d['y'][:n])
-            ppm_arr, ts_arr = np.array(d['ppm'][:n]), np.array(d['timestamp'][:n])
-            save_dict[f'{clean}_x'] = xs
-            save_dict[f'{clean}_y'] = ys_arr
-            save_dict[f'{clean}_ppm'] = ppm_arr
-            save_dict[f'{clean}_timestamp'] = ts_arr
+            save_dict[f'{clean}_x'] = np.array(d['x'])
+            save_dict[f'{clean}_y'] = np.array(d['y'])
+            save_dict[f'{clean}_ppm'] = np.array(d['ppm'])
+            save_dict[f'{clean}_timestamp'] = np.array(d['timestamp'])
 
             # Run source localization and save posterior
+            xs, ys_arr, ppm_arr = np.array(d['x']), np.array(d['y']), np.array(d['ppm'])
+            ts_arr = np.array(d['timestamp'])
             if len(xs) > 10:
                 # Per-gas LOCAL wind (the field is non-uniform); fall back to
                 # the global mean only if there isn't enough local wind data.
-                # CUSUM's calibrated baseline sigma is the honest sensor-noise
-                # scale for the source-likelihood (vs. the global median, which
-                # over-counts plume samples — see report §9.3).
-                cusum = self._cusums.get(t)
-                bsig = (cusum.baseline_sigma
-                        if (cusum is not None and cusum.is_calibrated()) else None)
+                # No CUSUM in the baseline, so the estimator uses its own
+                # global-median noise scale (baseline_sigma=None).
+                bsig = None
                 lw = self._local_wind(xs, ys_arr, ppm_arr)
                 g_up = lw[0] if lw else wind_up
                 g_cons = lw[2] if lw else wind_cons
@@ -1808,11 +1250,6 @@ class AutoCoverageMapper(Node):
                 save_dict[f'{clean}_low_confidence'] = np.array(r.get('low_confidence', False))
                 save_dict[f'{clean}_peak_ppm'] = np.array(r.get('peak_ppm', 0.0))
                 save_dict[f'{clean}_method'] = np.array(r.get('method', 'wind-free'))
-                # Export the CUSUM baseline so offline tools reproduce the same
-                # likelihood noise model and intensity 'trace' band.
-                if cusum is not None and cusum.is_calibrated():
-                    save_dict[f'{clean}_baseline_mu'] = np.array(cusum.baseline_mu)
-                    save_dict[f'{clean}_baseline_sigma'] = np.array(cusum.baseline_sigma)
 
         # Localization benchmark metrics (error vs. ground truth, latency, …)
         self._compute_localization_metrics()
@@ -1840,17 +1277,6 @@ class AutoCoverageMapper(Node):
             save_dict['coverage_pct'] = np.array(self._coverage_pct)
             save_dict['coverage_visited_cells'] = np.array(self._coverage_visited)
             save_dict['coverage_total_free_cells'] = np.array(self._coverage_total)
-
-        # Pseudo-YOLO no-go zone metadata
-        if self.nogo_skip_enabled:
-            save_dict['nogo_xy'] = np.array([self.nogo_x, self.nogo_y])
-            save_dict['nogo_radius'] = np.array(self.nogo_radius)
-            save_dict['nogo_label'] = np.array(self.nogo_label)
-            save_dict['nogo_detected'] = np.array(self._nogo_detected)
-            if self._nogo_event:
-                save_dict['nogo_detect_time'] = np.array(self._nogo_event['time'])
-                save_dict['nogo_detect_xy'] = np.array(
-                    [self._nogo_event['robot_x'], self._nogo_event['robot_y']])
 
         np.savez_compressed(npz_path, **save_dict)
         print(f"Saved NPZ archive: {npz_path}")
@@ -2205,36 +1631,12 @@ class AutoCoverageMapper(Node):
                                   edgecolor='gray', alpha=0.85),
                         family='monospace', zorder=6)
 
-            def _nogo(ax):
-                """Mark the detected high-risk zone (hazard/fire the robot
-                routed around) on the hazard map: a red radial 'danger glow', a
-                dashed keep-out boundary, a centre diamond and a label."""
-                if not self.nogo_skip_enabled:
-                    return
-                from matplotlib.patches import Circle
-                cx, cy, r = self.nogo_x, self.nogo_y, self.nogo_radius
-                # concentric fading rings -> radial high-risk "glow"
-                for frac, a in ((1.0, 0.10), (0.70, 0.15), (0.42, 0.22), (0.20, 0.32)):
-                    ax.add_patch(Circle((cx, cy), r * frac, facecolor='red',
-                                        edgecolor='none', alpha=a, zorder=5.3))
-                # keep-out boundary
-                ax.add_patch(Circle((cx, cy), r, facecolor='none', edgecolor='red',
-                                    linewidth=2.0, linestyle='--', zorder=5.6))
-                # centre marker (diamond) + label, echoing the hazard-map style
-                ax.plot(cx, cy, marker='D', color='red', markersize=10,
-                        markeredgecolor='white', markeredgewidth=1.2, zorder=6.6,
-                        label=f'Detected high-risk zone ({self.nogo_label})')
-                ax.annotate('Detected\nHigh-Risk Zone', xy=(cx, cy),
-                            xytext=(cx + r + 0.15, cy), fontsize=9, color='red',
-                            fontweight='bold', va='center', zorder=6.7)
-
             # ── 1) Coverage path ──
             fig, ax = plt.subplots(figsize=(10, 8))
             sc = ax.scatter(xs, ys, c=ppm, cmap=CMAP,
                             norm=PowerNorm(gamma=0.4, vmin=0, vmax=ppm_max),
                             alpha=0.8, s=8, zorder=2, edgecolors='none')
             _walls(ax)
-            _nogo(ax)
             plt.colorbar(sc, ax=ax, label='Concentration (ppm)', shrink=0.82)
             ax.plot(peak_x, peak_y, 'r*', markersize=14, zorder=6,
                     markeredgecolor='black', markeredgewidth=0.5,
@@ -2256,7 +1658,6 @@ class AutoCoverageMapper(Node):
             ax.contour(xi, yi, zi_cont_smooth, levels=levels, colors='#555555',
                        linewidths=0.35, alpha=0.45, zorder=2)
             _walls(ax)
-            _nogo(ax)
             sm = plt.cm.ScalarMappable(cmap=CMAP, norm=norm_log)
             plt.colorbar(sm, ax=ax, label='Concentration (ppm)', shrink=0.82)
             ax.plot(peak_x, peak_y, 'r*', markersize=14, zorder=6,
@@ -2278,7 +1679,6 @@ class AutoCoverageMapper(Node):
             ax.contour(xi, yi, zi_cont_smooth, levels=levels, colors='#555555',
                        linewidths=0.35, alpha=0.45, zorder=2)
             _walls(ax)
-            _nogo(ax)
             sm2 = plt.cm.ScalarMappable(cmap=CMAP, norm=norm_pow)
             plt.colorbar(sm2, ax=ax, label='Concentration (ppm)', shrink=0.82)
             ax.plot(peak_x, peak_y, 'r*', markersize=14, zorder=6,
@@ -2376,41 +1776,7 @@ class AutoCoverageMapper(Node):
             fig.savefig(os.path.join(out, f'{clean}_concentration.png'), dpi=250)
             plt.close(fig)
 
-            # ── 8) CUSUM detection ──
-            cusum_trace = []
-            cw, ck, ch, cnf = self._cusum_params
-            cusum_plot = CUSUMDetector(warmup=cw, k=ck, h=ch, noise_floor=cnf)
-            spike_regions = []
-            in_spike = False
-            for i, val in enumerate(ppm):
-                fired = cusum_plot.update(val)
-                cusum_trace.append(cusum_plot.current_S if cusum_plot.is_calibrated() else 0.0)
-                if fired and not in_spike:
-                    in_spike = True
-                    spike_regions.append([i, i])
-                elif fired:
-                    spike_regions[-1][1] = i
-                elif in_spike:
-                    in_spike = False
-                    cusum_plot.reset_alarm()
-
-            fig, ax = plt.subplots(figsize=(14, 4))
-            ax.plot(cusum_trace, linewidth=0.8, color='#2c3e50', label='CUSUM S(n)')
-            if cusum_plot.is_calibrated():
-                ax.axhline(y=cusum_plot.threshold, color='#c0392b', linestyle='--',
-                            alpha=0.7, linewidth=1.2, label=f'Threshold = {cusum_plot.threshold:.2f}')
-            for s, e in spike_regions:
-                ax.axvspan(s, e, alpha=0.12, color='#e74c3c')
-            ax.set_xlabel('Sample index')
-            ax.set_ylabel('CUSUM S(n)')
-            ax.set_title('CUSUM Change-Point Detection')
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.15)
-            fig.tight_layout()
-            fig.savefig(os.path.join(out, f'{clean}_cusum.png'), dpi=250)
-            plt.close(fig)
-
-            # ── 9) Dashboard (2x2) ──
+            # ── 8) Dashboard (2x2) ──
             fig, axes = plt.subplots(2, 2, figsize=(16, 14))
 
             axes[0, 0].scatter(xs, ys, c=ppm, cmap=CMAP,
@@ -2445,7 +1811,7 @@ class AutoCoverageMapper(Node):
             fig.savefig(os.path.join(out, f'{clean}_dashboard.png'), dpi=250)
             plt.close(fig)
 
-            # ── 10) Probabilistic source region + concentration intensity ──
+            # ── 9) Probabilistic source region + concentration intensity ──
             #   Delegated to gas_viz so live and offline figures are identical.
             r = self._loc_results.get(clean)
             if r is None:
@@ -2457,9 +1823,9 @@ class AutoCoverageMapper(Node):
             matched = ([{'name': entry.get('true_name', 'source'),
                          'x': entry['true_x'], 'y': entry['true_y']}]
                        if 'true_x' in entry else None)
-            _cu = self._cusums.get(t)
-            _bmu = _cu.baseline_mu if (_cu is not None and _cu.is_calibrated()) else 0.0
-            _bsig = _cu.baseline_sigma if (_cu is not None and _cu.is_calibrated()) else None
+            # No CUSUM baseline in the baseline mapper; gas_viz uses its defaults.
+            _bmu = 0.0
+            _bsig = None
             walls = (occ_rgba, occ_extent)
             gas_viz.concentration_intensity_map(
                 os.path.join(out, f'{clean}_concentration_intensity.png'),
@@ -2485,7 +1851,7 @@ class AutoCoverageMapper(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = AutoCoverageMapper()
+    node = CoverageMapperBaseline()
     exe = MultiThreadedExecutor()
     exe.add_node(node)
     try:

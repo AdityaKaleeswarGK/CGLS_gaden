@@ -15,3 +15,18 @@ build
 result
 OccupancyGrid3D.csv
 wind
+# --- Keep only the core logic files and results in test_env/scripts ---
+/*
+!/.gitignore
+!/test_env/
+/test_env/*
+!/test_env/scripts/
+/test_env/scripts/*
+
+!/test_env/scripts/auto_coverage_mapper.py
+!/test_env/scripts/concentration_mapper.py
+!/test_env/scripts/gas_viz.py
+!/test_env/scripts/plot_from_npz.py
+!/test_env/scripts/coverage_mapper_baseline.py
+!/test_env/scripts/README.md
+!/test_env/scripts/results/

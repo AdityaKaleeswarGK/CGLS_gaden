@@ -40,7 +40,7 @@ ros2 launch test_env main_simbot_launch.py \
 ### Stage 4: Run the Auto-Coverage Mapper
 In a new sourced terminal, launch the adaptive coverage script:
 ```bash
-python3 ~/ros2_ws/src/gaden/test_env/scripts/auto_coverage_mapper.py \
+python3 ~/ros2_ws/src/gaden/auto_coverage_mapper.py \
   --ros-args -p generate_plots:=true \
   -p scenario_path:=$HOME/ros2_ws/install/test_env/share/test_env/scenarios/SCEN/environment_configurations/config1
 ```
